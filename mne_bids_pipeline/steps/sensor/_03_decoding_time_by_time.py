@@ -13,50 +13,51 @@ can learn about the entire time course of the signal.
 
 import os.path as op
 from types import SimpleNamespace
-from typing import Optional
-
-import numpy as np
-import pandas as pd
-from scipy.io import savemat, loadmat
 
 import mne
-from mne.decoding import GeneralizingEstimator, SlidingEstimator, cross_val_multiscore
-
+import numpy as np
+import pandas as pd
+from mne.decoding import (
+    GeneralizingEstimator,
+    SlidingEstimator,
+    Vectorizer,
+    cross_val_multiscore,
+)
 from mne_bids import BIDSPath
-
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
+from scipy.io import loadmat, savemat
 from sklearn.model_selection import StratifiedKFold
+from sklearn.pipeline import make_pipeline
 
 from ..._config_utils import (
+    _bids_kwargs,
+    _get_decoding_proc,
+    _restrict_analyze_channels,
+    get_decoding_contrasts,
+    get_eeg_reference,
     get_sessions,
     get_subjects,
-    get_eeg_reference,
-    get_decoding_contrasts,
-    _bids_kwargs,
-    _restrict_analyze_channels,
 )
-from ..._decoding import LogReg
+from ..._decoding import LogReg, _decoding_preproc_steps
 from ..._logging import gen_log_kwargs, logger
-from ..._run import failsafe_run, save_logs
 from ..._parallel import get_parallel_backend, get_parallel_backend_name
 from ..._report import (
     _open_report,
     _plot_decoding_time_generalization,
-    _sanitize_cond_tag,
     _plot_time_by_time_decoding_scores,
+    _sanitize_cond_tag,
 )
+from ..._run import _prep_out_files, _update_for_splits, failsafe_run, save_logs
 
 
 def get_input_fnames_time_decoding(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
     condition1: str,
     condition2: str,
 ) -> dict:
-    # TODO: Shouldn't this at least use the PTP-rejected epochs if available?
+    proc = _get_decoding_proc(config=cfg)
     fname_epochs = BIDSPath(
         subject=subject,
         session=session,
@@ -65,6 +66,7 @@ def get_input_fnames_time_decoding(
         run=None,
         recording=cfg.rec,
         space=cfg.space,
+        processing=proc,
         suffix="epo",
         extension=".fif",
         datatype=cfg.datatype,
@@ -73,6 +75,7 @@ def get_input_fnames_time_decoding(
     )
     in_files = dict()
     in_files["epochs"] = fname_epochs
+    _update_for_splits(in_files, "epochs", single=True)
     return in_files
 
 
@@ -84,7 +87,7 @@ def run_time_decoding(
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
     condition1: str,
     condition2: str,
     in_files: dict,
@@ -98,7 +101,7 @@ def run_time_decoding(
     msg = f"Contrasting conditions ({kind}): {condition1} – {condition2}"
     logger.info(**gen_log_kwargs(message=msg))
     out_files = dict()
-    bids_path = in_files["epochs"].copy()
+    bids_path = in_files["epochs"].copy().update(split=None)
 
     epochs = mne.read_epochs(in_files.pop("epochs"))
     _restrict_analyze_channels(epochs, cfg)
@@ -122,6 +125,22 @@ def run_time_decoding(
     epochs = mne.concatenate_epochs([epochs[epochs_conds[0]], epochs[epochs_conds[1]]])
     n_cond1 = len(epochs[epochs_conds[0]])
     n_cond2 = len(epochs[epochs_conds[1]])
+    epochs.pick_types(meg=True, eeg=True, ref_meg=False, exclude="bads")
+    # We can't use the full rank here because the number of samples can just be the
+    # number of epochs (which can be fewer than the number of channels)
+    pre_steps = _decoding_preproc_steps(
+        subject=subject,
+        session=session,
+        epochs=epochs,
+        pca=False,
+    )
+    # At some point we might want to enable this, but it's really slow and arguably
+    # unnecessary so let's omit it for now:
+    # pre_steps.append(
+    #     mne.decoding.UnsupervisedSpatialFilter(
+    #         PCA(n_components=0.999, whiten=True),
+    #     )
+    # )
 
     decim = cfg.decoding_time_generalization_decim
     if cfg.decoding_time_generalization and decim > 1:
@@ -133,7 +152,8 @@ def run_time_decoding(
     verbose = get_parallel_backend_name(exec_params=exec_params) != "dask"
     with get_parallel_backend(exec_params):
         clf = make_pipeline(
-            StandardScaler(),
+            *pre_steps,
+            Vectorizer(),
             LogReg(
                 solver="liblinear",  # much faster than the default
                 random_state=cfg.random_state,
@@ -286,7 +306,7 @@ def run_time_decoding(
             del decoding_data, cond_1, cond_2, caption
 
     assert len(in_files) == 0, in_files.keys()
-    return out_files
+    return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
 
 def get_config(
@@ -297,6 +317,7 @@ def get_config(
         conditions=config.conditions,
         contrasts=get_decoding_contrasts(config),
         decode=config.decode,
+        decoding_which_epochs=config.decoding_which_epochs,
         decoding_metric=config.decoding_metric,
         decoding_n_splits=config.decoding_n_splits,
         decoding_time_generalization=config.decoding_time_generalization,
@@ -314,12 +335,12 @@ def main(*, config: SimpleNamespace) -> None:
     """Run time-by-time decoding."""
     if not config.contrasts:
         msg = "No contrasts specified; not performing decoding."
-        logger.info(**gen_log_kwargs(message=msg))
+        logger.info(**gen_log_kwargs(message=msg, emoji="skip"))
         return
 
     if not config.decode:
         msg = "No decoding requested by user."
-        logger.info(**gen_log_kwargs(message=msg))
+        logger.info(**gen_log_kwargs(message=msg, emoji="skip"))
         return
 
     # Here we go parallel inside the :class:`mne.decoding.SlidingEstimator`

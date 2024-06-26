@@ -10,48 +10,46 @@ which condition.
 
 import os.path as op
 from types import SimpleNamespace
-from typing import Optional
-
-import numpy as np
-import pandas as pd
-from scipy.io import savemat, loadmat
-
-from sklearn.model_selection import cross_val_score
-from sklearn.pipeline import make_pipeline
-from sklearn.model_selection import StratifiedKFold
 
 import mne
-from mne.decoding import Scaler, Vectorizer
+import numpy as np
+import pandas as pd
+from mne.decoding import Vectorizer
 from mne_bids import BIDSPath
+from scipy.io import loadmat, savemat
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.pipeline import make_pipeline
 
 from ..._config_utils import (
+    _bids_kwargs,
+    _get_decoding_proc,
+    _restrict_analyze_channels,
+    get_decoding_contrasts,
+    get_eeg_reference,
     get_sessions,
     get_subjects,
-    get_eeg_reference,
-    get_decoding_contrasts,
-    _bids_kwargs,
-    _restrict_analyze_channels,
 )
+from ..._decoding import LogReg, _decoding_preproc_steps
 from ..._logging import gen_log_kwargs, logger
-from ..._decoding import LogReg
-from ..._parallel import parallel_func, get_parallel_backend
-from ..._run import failsafe_run, save_logs
+from ..._parallel import get_parallel_backend, parallel_func
 from ..._report import (
-    _open_report,
     _contrasts_to_names,
+    _open_report,
     _plot_full_epochs_decoding_scores,
     _sanitize_cond_tag,
 )
+from ..._run import _prep_out_files, _update_for_splits, failsafe_run, save_logs
 
 
 def get_input_fnames_epochs_decoding(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
     condition1: str,
     condition2: str,
 ) -> dict:
+    proc = _get_decoding_proc(config=cfg)
     fname_epochs = BIDSPath(
         subject=subject,
         session=session,
@@ -60,6 +58,7 @@ def get_input_fnames_epochs_decoding(
         run=None,
         recording=cfg.rec,
         space=cfg.space,
+        processing=proc,
         suffix="epo",
         extension=".fif",
         datatype=cfg.datatype,
@@ -68,6 +67,7 @@ def get_input_fnames_epochs_decoding(
     )
     in_files = dict()
     in_files["epochs"] = fname_epochs
+    _update_for_splits(in_files, "epochs", single=True)
     return in_files
 
 
@@ -79,7 +79,7 @@ def run_epochs_decoding(
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
     condition1: str,
     condition2: str,
     in_files: dict,
@@ -89,11 +89,10 @@ def run_epochs_decoding(
     msg = f"Contrasting conditions: {condition1} – {condition2}"
     logger.info(**gen_log_kwargs(message=msg))
     out_files = dict()
-    bids_path = in_files["epochs"].copy()
+    bids_path = in_files["epochs"].copy().update(split=None)
 
     epochs = mne.read_epochs(in_files.pop("epochs"))
     _restrict_analyze_channels(epochs, cfg)
-    epochs.crop(cfg.decoding_epochs_tmin, cfg.decoding_epochs_tmax)
 
     # We define the epochs and the labels
     if isinstance(cfg.conditions, dict):
@@ -110,15 +109,26 @@ def run_epochs_decoding(
         [epochs[epochs_conds[0]], epochs[epochs_conds[1]]], verbose="error"
     )
 
+    # Crop to the desired analysis interval. Do it only after the concatenation to work
+    # around https://github.com/mne-tools/mne-python/issues/12153
+    epochs.crop(cfg.decoding_epochs_tmin, cfg.decoding_epochs_tmax)
+    # omit bad channels and reference MEG sensors
+    epochs.pick_types(meg=True, eeg=True, ref_meg=False, exclude="bads")
+    pre_steps = _decoding_preproc_steps(
+        subject=subject,
+        session=session,
+        epochs=epochs,
+    )
+
     n_cond1 = len(epochs[epochs_conds[0]])
     n_cond2 = len(epochs[epochs_conds[1]])
 
     X = epochs.get_data()
     y = np.r_[np.ones(n_cond1), np.zeros(n_cond2)]
 
-    classification_pipeline = make_pipeline(
-        Scaler(scalings="mean"),
-        Vectorizer(),  # So we can pass the data to scikit-learn
+    clf = make_pipeline(
+        *pre_steps,
+        Vectorizer(),
         LogReg(
             solver="liblinear",  # much faster than the default
             random_state=cfg.random_state,
@@ -134,7 +144,13 @@ def run_epochs_decoding(
         n_splits=cfg.decoding_n_splits,
     )
     scores = cross_val_score(
-        estimator=classification_pipeline, X=X, y=y, cv=cv, scoring="roc_auc", n_jobs=1
+        estimator=clf,
+        X=X,
+        y=y,
+        cv=cv,
+        scoring="roc_auc",
+        n_jobs=1,
+        error_score="raise",
     )
 
     # Save the scores
@@ -184,7 +200,7 @@ def run_epochs_decoding(
             all_contrasts.append(contrast)
             del fname_decoding, processing, a_vs_b, decoding_data
 
-        fig, caption = _plot_full_epochs_decoding_scores(
+        fig, caption, _ = _plot_full_epochs_decoding_scores(
             contrast_names=_contrasts_to_names(all_contrasts),
             scores=all_decoding_scores,
             metric=cfg.decoding_metric,
@@ -209,7 +225,7 @@ def run_epochs_decoding(
         plt.close(fig)
 
     assert len(in_files) == 0, in_files.keys()
-    return out_files
+    return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
 
 def get_config(
@@ -220,6 +236,7 @@ def get_config(
         conditions=config.conditions,
         contrasts=get_decoding_contrasts(config),
         decode=config.decode,
+        decoding_which_epochs=config.decoding_which_epochs,
         decoding_metric=config.decoding_metric,
         decoding_epochs_tmin=config.decoding_epochs_tmin,
         decoding_epochs_tmax=config.decoding_epochs_tmax,
@@ -237,12 +254,12 @@ def main(*, config: SimpleNamespace) -> None:
     """Run time-by-time decoding."""
     if not config.contrasts:
         msg = "No contrasts specified; not performing decoding."
-        logger.info(**gen_log_kwargs(message=msg))
+        logger.info(**gen_log_kwargs(message=msg, emoji="skip"))
         return
 
     if not config.decode:
         msg = "No decoding requested by user."
-        logger.info(**gen_log_kwargs(message=msg))
+        logger.info(**gen_log_kwargs(message=msg, emoji="skip"))
         return
 
     with get_parallel_backend(config.exec_params):

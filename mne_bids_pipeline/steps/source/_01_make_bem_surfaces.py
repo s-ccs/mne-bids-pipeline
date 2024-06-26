@@ -10,14 +10,17 @@ from types import SimpleNamespace
 import mne
 
 from ..._config_utils import (
-    get_fs_subject,
-    get_subjects,
+    _bids_kwargs,
     _get_bem_conductivity,
+    get_fs_subject,
     get_fs_subjects_dir,
+    get_sessions,
+    get_subjects,
 )
-from ..._logging import logger, gen_log_kwargs
+from ..._logging import gen_log_kwargs, logger
 from ..._parallel import get_parallel_backend, parallel_func
-from ..._run import failsafe_run, save_logs
+from ..._report import _open_report, _render_bem
+from ..._run import _prep_out_files, failsafe_run, save_logs
 
 
 def _get_bem_params(cfg: SimpleNamespace):
@@ -38,6 +41,7 @@ def get_input_fnames_make_bem_surfaces(
     *,
     cfg: SimpleNamespace,
     subject: str,
+    session: str | None,
 ) -> dict:
     in_files = dict()
     mri_images, mri_dir, flash_dir = _get_bem_params(cfg)
@@ -54,6 +58,7 @@ def get_output_fnames_make_bem_surfaces(
     *,
     cfg: SimpleNamespace,
     subject: str,
+    session: str | None,
 ) -> dict:
     out_files = dict()
     conductivity, _ = _get_bem_conductivity(cfg)
@@ -73,6 +78,7 @@ def make_bem_surfaces(
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
+    session: str | None,
     in_files: dict,
 ) -> dict:
     mri_images, _, _ = _get_bem_params(cfg)
@@ -96,8 +102,21 @@ def make_bem_surfaces(
         show=show,
         verbose=cfg.freesurfer_verbose,
     )
-    out_files = get_output_fnames_make_bem_surfaces(cfg=cfg, subject=subject)
-    return out_files
+    with _open_report(
+        cfg=cfg, exec_params=exec_params, subject=subject, session=session
+    ) as report:
+        _render_bem(report=report, cfg=cfg, subject=subject, session=session)
+    out_files = get_output_fnames_make_bem_surfaces(
+        cfg=cfg,
+        subject=subject,
+        session=session,
+    )
+    return _prep_out_files(
+        exec_params=exec_params,
+        out_files=out_files,
+        check_relative=cfg.fs_subjects_dir,
+        bids_only=False,
+    )
 
 
 def get_config(
@@ -112,6 +131,7 @@ def get_config(
         freesurfer_verbose=config.freesurfer_verbose,
         use_template_mri=config.use_template_mri,
         ch_types=config.ch_types,
+        **_bids_kwargs(config=config),
     )
     return cfg
 
@@ -143,6 +163,7 @@ def main(*, config: SimpleNamespace) -> None:
                 ),
                 exec_params=config.exec_params,
                 subject=subject,
+                session=get_sessions(config)[0],
                 force_run=config.recreate_bem,
             )
             for subject in get_subjects(config)

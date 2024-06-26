@@ -7,36 +7,37 @@ Finally the epochs are saved to disk. For the moment, no rejection is applied.
 To save space, the epoch data can be decimated.
 """
 
+import inspect
 from types import SimpleNamespace
-from typing import Optional
 
 import mne
 from mne_bids import BIDSPath
 
 from ..._config_utils import (
-    get_runs,
-    get_subjects,
-    get_eeg_reference,
-    get_sessions,
     _bids_kwargs,
+    get_eeg_reference,
+    get_runs,
+    get_sessions,
+    get_subjects,
 )
-from ..._import_data import make_epochs, annotations_to_events
+from ..._import_data import annotations_to_events, make_epochs
 from ..._logging import gen_log_kwargs, logger
+from ..._parallel import get_parallel_backend, parallel_func
 from ..._report import _open_report
 from ..._run import (
+    _prep_out_files,
+    _sanitize_callable,
+    _update_for_splits,
     failsafe_run,
     save_logs,
-    _update_for_splits,
-    _sanitize_callable,
 )
-from ..._parallel import parallel_func, get_parallel_backend
 
 
 def get_input_fnames_epochs(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
 ) -> dict:
     """Get paths of files required by filter_data function."""
     # Construct the basenames of the files we wish to load, and of the empty-
@@ -53,7 +54,7 @@ def get_input_fnames_epochs(
         extension=".fif",
         datatype=cfg.datatype,
         root=cfg.deriv_root,
-        processing="filt",
+        processing=cfg.processing,
     ).update(suffix="raw", check=False)
 
     # Generate a list of raw data paths (i.e., paths of individual runs)
@@ -77,7 +78,7 @@ def run_epochs(
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
     in_files: dict,
 ) -> dict:
     """Extract epochs for one subject."""
@@ -213,7 +214,10 @@ def run_epochs(
     logger.info(**gen_log_kwargs(message=msg))
     out_files = dict()
     out_files["epochs"] = bids_path_in.copy().update(
-        suffix="epo", processing=None, check=False
+        suffix="epo",
+        processing=None,
+        check=False,
+        split=None,
     )
     epochs.save(
         out_files["epochs"],
@@ -255,6 +259,7 @@ def run_epochs(
             psd=psd,
             drop_log_ignore=(),
             replace=True,
+            **_add_epochs_image_kwargs(cfg),
         )
 
     # Interactive
@@ -262,7 +267,15 @@ def run_epochs(
         epochs.plot()
         epochs.plot_image(combine="gfp", sigma=2.0, cmap="YlGnBu_r")
     assert len(in_files) == 0, in_files.keys()
-    return out_files
+    return _prep_out_files(exec_params=exec_params, out_files=out_files)
+
+
+def _add_epochs_image_kwargs(cfg: SimpleNamespace) -> dict:
+    arg_spec = inspect.getfullargspec(mne.Report.add_epochs)
+    kwargs = dict()
+    if cfg.report_add_epochs_image_kwargs and "image_kwargs" in arg_spec.kwonlyargs:
+        kwargs["image_kwargs"] = cfg.report_add_epochs_image_kwargs
+    return kwargs
 
 
 # TODO: ideally we wouldn't need this anymore and could refactor the code above
@@ -275,7 +288,7 @@ def _get_events(cfg, subject, session):
         acquisition=cfg.acq,
         recording=cfg.rec,
         space=cfg.space,
-        processing="filt",
+        processing=cfg.processing,
         suffix="raw",
         extension=".fif",
         datatype=cfg.datatype,
@@ -314,6 +327,7 @@ def get_config(
         epochs_metadata_query=config.epochs_metadata_query,
         event_repeated=config.event_repeated,
         epochs_decim=config.epochs_decim,
+        report_add_epochs_image_kwargs=config.report_add_epochs_image_kwargs,
         ch_types=config.ch_types,
         noise_cov=_sanitize_callable(config.noise_cov),
         eeg_reference=get_eeg_reference(config),
@@ -321,6 +335,7 @@ def get_config(
         rest_epochs_overlap=config.rest_epochs_overlap,
         _epochs_split_size=config._epochs_split_size,
         runs=get_runs(config=config, subject=subject),
+        processing="filt" if config.regress_artifact is None else "regress",
         **_bids_kwargs(config=config),
     )
     return cfg

@@ -1,50 +1,47 @@
-"""
-Decoding based on common spatial patterns (CSP).
-"""
+"""Decoding based on common spatial patterns (CSP)."""
 
 import os.path as op
 from types import SimpleNamespace
-from typing import Dict, Optional, Tuple
 
+import matplotlib.transforms
 import mne
 import numpy as np
 import pandas as pd
-import matplotlib.transforms
-from mne.decoding import CSP, UnsupervisedSpatialFilter
+from mne.decoding import CSP
 from mne_bids import BIDSPath
-from sklearn.decomposition import PCA
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.pipeline import make_pipeline
 
 from ..._config_utils import (
+    _bids_kwargs,
+    _get_decoding_proc,
+    _restrict_analyze_channels,
+    get_decoding_contrasts,
+    get_eeg_reference,
     get_sessions,
     get_subjects,
-    get_eeg_reference,
-    get_decoding_contrasts,
-    _bids_kwargs,
-    _restrict_analyze_channels,
 )
-from ..._decoding import LogReg, _handle_csp_args
-from ..._logging import logger, gen_log_kwargs
-from ..._parallel import parallel_func, get_parallel_backend
-from ..._run import failsafe_run, save_logs
+from ..._decoding import LogReg, _decoding_preproc_steps, _handle_csp_args
+from ..._logging import gen_log_kwargs, logger
+from ..._parallel import get_parallel_backend, parallel_func
 from ..._report import (
-    _open_report,
-    _sanitize_cond_tag,
-    _plot_full_epochs_decoding_scores,
     _imshow_tf,
+    _open_report,
+    _plot_full_epochs_decoding_scores,
+    _sanitize_cond_tag,
 )
+from ..._run import _prep_out_files, _update_for_splits, failsafe_run, save_logs
 
 
-def _prepare_labels(*, epochs: mne.BaseEpochs, contrast: Tuple[str, str]) -> np.ndarray:
+def _prepare_labels(*, epochs: mne.BaseEpochs, contrast: tuple[str, str]) -> np.ndarray:
     """Return the projection of the events_id on a boolean vector.
 
     This projection is useful in the case of hierarchical events:
     we project the different events contained in one condition into
     just one label.
 
-    Returns:
-    --------
+    Returns
+    -------
     A boolean numpy array containing the labels.
     """
     epochs_cond_0 = epochs[contrast[0]]
@@ -78,27 +75,18 @@ def _prepare_labels(*, epochs: mne.BaseEpochs, contrast: Tuple[str, str]) -> np.
 
 
 def prepare_epochs_and_y(
-    *, epochs: mne.BaseEpochs, contrast: Tuple[str, str], cfg, fmin: float, fmax: float
-) -> Tuple[mne.BaseEpochs, np.ndarray]:
+    *, epochs: mne.BaseEpochs, contrast: tuple[str, str], cfg, fmin: float, fmax: float
+) -> tuple[mne.BaseEpochs, np.ndarray]:
     """Band-pass between, sub-select the desired epochs, and prepare y."""
-    epochs_filt = epochs.copy().pick_types(
-        meg=True,
-        eeg=True,
-    )
-
-    # We only take mag to speed up computation
-    # because the information is redundant between grad and mag
-    if cfg.datatype == "meg" and cfg.use_maxwell_filter:
-        epochs_filt.pick_types(meg="mag")
-
     # filtering out the conditions we are not interested in, to ensure here we
     # have a valid partition between the condition of the contrast.
-    #
+
     # XXX Hack for handling epochs selection via metadata
+    # This also makes a copy
     if contrast[0].startswith("event_name.isin"):
-        epochs_filt = epochs_filt[f"{contrast[0]} or {contrast[1]}"]
+        epochs_filt = epochs[f"{contrast[0]} or {contrast[1]}"]
     else:
-        epochs_filt = epochs_filt[contrast]
+        epochs_filt = epochs[contrast]
 
     # Filtering is costly, so do it last, after the selection of the channels
     # and epochs. We know that often the filter will be longer than the signal,
@@ -113,9 +101,10 @@ def get_input_fnames_csp(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
-    contrast: Tuple[str],
+    session: str | None,
+    contrast: tuple[str],
 ) -> dict:
+    proc = _get_decoding_proc(config=cfg)
     fname_epochs = BIDSPath(
         subject=subject,
         session=session,
@@ -124,6 +113,7 @@ def get_input_fnames_csp(
         run=None,
         recording=cfg.rec,
         space=cfg.space,
+        processing=proc,
         suffix="epo",
         extension=".fif",
         datatype=cfg.datatype,
@@ -132,6 +122,7 @@ def get_input_fnames_csp(
     )
     in_files = dict()
     in_files["epochs"] = fname_epochs
+    _update_for_splits(in_files, "epochs", single=True)
     return in_files
 
 
@@ -142,8 +133,8 @@ def one_subject_decoding(
     exec_params: SimpleNamespace,
     subject: str,
     session: str,
-    contrast: Tuple[str, str],
-    in_files: Dict[str, BIDSPath],
+    contrast: tuple[str, str],
+    in_files: dict[str, BIDSPath],
 ) -> dict:
     """Run one subject.
 
@@ -157,33 +148,27 @@ def one_subject_decoding(
     msg = f"Contrasting conditions: {condition1} – {condition2}"
     logger.info(**gen_log_kwargs(msg))
 
-    bids_path = in_files["epochs"].copy().update(processing=None)
+    bids_path = in_files["epochs"].copy().update(processing=None, split=None)
     epochs = mne.read_epochs(in_files.pop("epochs"))
     _restrict_analyze_channels(epochs, cfg)
+    epochs.pick_types(meg=True, eeg=True, ref_meg=False, exclude="bads")
 
     if cfg.time_frequency_subtract_evoked:
         epochs.subtract_evoked()
 
-    # Perform rank reduction via PCA.
-    #
-    # Select the channel type with the smallest rank.
-    # Limit it to a maximum of 100.
-    ranks = mne.compute_rank(inst=epochs, rank="info")
-    ch_type_smallest_rank = min(ranks, key=ranks.get)
-    rank = min(ranks[ch_type_smallest_rank], 100)
-    del ch_type_smallest_rank, ranks
-
-    msg = f"Reducing data dimension via PCA; new rank: {rank}."
-    logger.info(**gen_log_kwargs(msg))
-    pca = UnsupervisedSpatialFilter(PCA(rank), average=False)
+    preproc_steps = _decoding_preproc_steps(
+        subject=subject,
+        session=session,
+        epochs=epochs,
+    )
 
     # Classifier
     csp = CSP(
         n_components=4,  # XXX revisit
         reg=0.1,  # XXX revisit
-        rank="info",
     )
     clf = make_pipeline(
+        *preproc_steps,
         csp,
         LogReg(
             solver="liblinear",  # much faster than the default
@@ -198,8 +183,14 @@ def one_subject_decoding(
     )
 
     # Loop over frequencies (all time points lumped together)
-    freq_name_to_bins_map = _handle_csp_args(
-        cfg.decoding_csp_times, cfg.decoding_csp_freqs, cfg.decoding_metric
+    freq_name_to_bins_map, time_bins = _handle_csp_args(
+        cfg.decoding_csp_times,
+        cfg.decoding_csp_freqs,
+        cfg.decoding_metric,
+        epochs_tmin=cfg.epochs_tmin,
+        epochs_tmax=cfg.epochs_tmax,
+        time_frequency_freq_min=cfg.time_frequency_freq_min,
+        time_frequency_freq_max=cfg.time_frequency_freq_max,
     )
     freq_decoding_table_rows = []
     for freq_range_name, freq_bins in freq_name_to_bins_map.items():
@@ -251,19 +242,14 @@ def one_subject_decoding(
         # Get the data for all time points
         X = epochs_filt.get_data()
 
-        # We apply PCA before running CSP:
-        # - much faster CSP processing
-        # - reduced risk of numerical instabilities.
-        X_pca = pca.fit_transform(X)
-        del X
-
         cv_scores = cross_val_score(
             estimator=clf,
-            X=X_pca,
+            X=X,
             y=y,
             scoring=cfg.decoding_metric,
             cv=cv,
             n_jobs=1,
+            error_score="raise",
         )
         freq_decoding_table.loc[idx, "mean_crossval_score"] = cv_scores.mean()
         freq_decoding_table.at[idx, "scores"] = cv_scores
@@ -272,11 +258,6 @@ def one_subject_decoding(
     #
     # Note: We don't support varying time ranges for different frequency
     # ranges to avoid leaking of information.
-    time_bins = np.array(cfg.decoding_csp_times)
-    if time_bins.ndim == 1:
-        time_bins = np.array(list(zip(time_bins[:-1], time_bins[1:])))
-    assert time_bins.ndim == 2
-
     tf_decoding_table_rows = []
 
     for freq_range_name, freq_bins in freq_name_to_bins_map.items():
@@ -300,13 +281,18 @@ def one_subject_decoding(
                 }
                 tf_decoding_table_rows.append(row)
 
-    tf_decoding_table = pd.concat(
-        [pd.DataFrame.from_dict(row) for row in tf_decoding_table_rows],
-        ignore_index=True,
-    )
+    if len(tf_decoding_table_rows):
+        tf_decoding_table = pd.concat(
+            [pd.DataFrame.from_dict(row) for row in tf_decoding_table_rows],
+            ignore_index=True,
+        )
+    else:
+        tf_decoding_table = pd.DataFrame()
     del tf_decoding_table_rows
 
     for idx, row in tf_decoding_table.iterrows():
+        if len(row) == 0:
+            break  # no data
         tmin = row["t_min"]
         tmax = row["t_max"]
         fmin = row["f_min"]
@@ -321,18 +307,16 @@ def one_subject_decoding(
         # Crop data to the time window of interest
         if tmax is not None:  # avoid warnings about outside the interval
             tmax = min(tmax, epochs_filt.times[-1])
-        epochs_filt.crop(tmin, tmax)
-        X = epochs_filt.get_data()
-        X_pca = pca.transform(X)
-        del X
-
+        X = epochs_filt.crop(tmin, tmax).get_data()
+        del epochs_filt
         cv_scores = cross_val_score(
             estimator=clf,
-            X=X_pca,
+            X=X,
             y=y,
             scoring=cfg.decoding_metric,
             cv=cv,
             n_jobs=1,
+            error_score="raise",
         )
         score = cv_scores.mean()
         tf_decoding_table.loc[idx, "mean_crossval_score"] = score
@@ -351,8 +335,10 @@ def one_subject_decoding(
     )
     with pd.ExcelWriter(fname_results) as w:
         freq_decoding_table.to_excel(w, sheet_name="CSP Frequency", index=False)
-        tf_decoding_table.to_excel(w, sheet_name="CSP Time-Frequency", index=False)
+        if not tf_decoding_table.empty:
+            tf_decoding_table.to_excel(w, sheet_name="CSP Time-Frequency", index=False)
     out_files = {"csp-excel": fname_results}
+    del freq_decoding_table
 
     # Report
     with _open_report(
@@ -361,11 +347,6 @@ def one_subject_decoding(
         msg = "Adding CSP decoding results to the report."
         logger.info(**gen_log_kwargs(message=msg))
         section = "Decoding: CSP"
-        freq_name_to_bins_map = _handle_csp_args(
-            cfg.decoding_csp_times,
-            cfg.decoding_csp_freqs,
-            cfg.decoding_metric,
-        )
         all_csp_tf_results = dict()
         for contrast in cfg.decoding_contrasts:
             cond_1, cond_2 = contrast
@@ -388,14 +369,15 @@ def one_subject_decoding(
             csp_freq_results["scores"] = csp_freq_results["scores"].apply(
                 lambda x: np.array(x[1:-1].split(), float)
             )
-            csp_tf_results = pd.read_excel(
-                fname_decoding, sheet_name="CSP Time-Frequency"
-            )
-            csp_tf_results["scores"] = csp_tf_results["scores"].apply(
-                lambda x: np.array(x[1:-1].split(), float)
-            )
-            all_csp_tf_results[contrast] = csp_tf_results
-            del csp_tf_results
+            if not tf_decoding_table.empty:
+                csp_tf_results = pd.read_excel(
+                    fname_decoding, sheet_name="CSP Time-Frequency"
+                )
+                csp_tf_results["scores"] = csp_tf_results["scores"].apply(
+                    lambda x: np.array(x[1:-1].split(), float)
+                )
+                all_csp_tf_results[contrast] = csp_tf_results
+                del csp_tf_results
 
             all_decoding_scores = list()
             contrast_names = list()
@@ -412,7 +394,7 @@ def one_subject_decoding(
                     contrast_names.append(
                         f"{freq_range_name}\n" f"({f_min:0.1f}-{f_max:0.1f} Hz)"
                     )
-            fig, caption = _plot_full_epochs_decoding_scores(
+            fig, caption, _ = _plot_full_epochs_decoding_scores(
                 contrast_names=contrast_names,
                 scores=all_decoding_scores,
                 metric=cfg.decoding_metric,
@@ -445,11 +427,13 @@ def one_subject_decoding(
             results = all_csp_tf_results[contrast]
             mean_crossval_scores = list()
             tmin, tmax, fmin, fmax = list(), list(), list(), list()
-            mean_crossval_scores.extend(results["mean_crossval_score"].ravel())
-            tmin.extend(results["t_min"].ravel())
-            tmax.extend(results["t_max"].ravel())
-            fmin.extend(results["f_min"].ravel())
-            fmax.extend(results["f_max"].ravel())
+            mean_crossval_scores.extend(
+                results["mean_crossval_score"].to_numpy().ravel()
+            )
+            tmin.extend(results["t_min"].to_numpy().ravel())
+            tmax.extend(results["t_max"].to_numpy().ravel())
+            fmin.extend(results["f_min"].to_numpy().ravel())
+            fmax.extend(results["f_max"].to_numpy().ravel())
             mean_crossval_scores = np.array(mean_crossval_scores, float)
             fig, ax = plt.subplots(constrained_layout=True)
             # XXX Add support for more metrics
@@ -502,13 +486,15 @@ def one_subject_decoding(
                 tags=tags,
                 replace=True,
             )
+            plt.close(fig)
+            del fig, title
 
     assert len(in_files) == 0, in_files.keys()
-    return out_files
+    return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
 
 def get_config(
-    *, config: SimpleNamespace, subject: str, session: Optional[str]
+    *, config: SimpleNamespace, subject: str, session: str | None
 ) -> SimpleNamespace:
     cfg = SimpleNamespace(
         # Data parameters
@@ -517,7 +503,12 @@ def get_config(
         ch_types=config.ch_types,
         eeg_reference=get_eeg_reference(config),
         # Processing parameters
+        epochs_tmin=config.epochs_tmin,
+        epochs_tmax=config.epochs_tmax,
+        time_frequency_freq_min=config.time_frequency_freq_min,
+        time_frequency_freq_max=config.time_frequency_freq_max,
         time_frequency_subtract_evoked=config.time_frequency_subtract_evoked,
+        decoding_which_epochs=config.decoding_which_epochs,
         decoding_metric=config.decoding_metric,
         decoding_csp_freqs=config.decoding_csp_freqs,
         decoding_csp_times=config.decoding_csp_times,

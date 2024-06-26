@@ -2,6 +2,7 @@
 
 
 def pytest_addoption(parser):
+    """Add pytest command line options."""
     parser.addoption(
         "--download",
         action="store_true",
@@ -10,6 +11,7 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
+    """Add pytest configuration settings."""
     # register an additional marker
     config.addinivalue_line("markers", "dataset_test: mark that a test runs a dataset")
     warning_lines = r"""
@@ -34,6 +36,43 @@ def pytest_configure(config):
     # seaborn calling tight layout, etc.
     ignore:The figure layout has changed to tight:UserWarning
     ignore:The \S+_cmap function was deprecated.*:DeprecationWarning
+    # seaborn->pandas
+    ignore:is_categorical_dtype is deprecated.*:FutureWarning
+    ignore:use_inf_as_na option is deprecated.*:FutureWarning
+    # Dask distributed with jsonschema 4.18
+    ignore:jsonschema\.RefResolver is deprecated.*:DeprecationWarning
+    # seaborn->pandas
+    ignore:is_categorical_dtype is deprecated.*:FutureWarning
+    ignore:use_inf_as_na option is deprecated.*:FutureWarning
+    ignore:All-NaN axis encountered.*:RuntimeWarning
+    # sklearn class not enough samples for cv=5
+    always:The least populated class in y has only.*:UserWarning
+    # constrained layout fails on ds003392
+    # mne_bids_pipeline/steps/preprocessing/_06a_run_ica.py:551: in run_ica
+    #    report.add_ica(
+    #../python_env/lib/python3.10/site-packages/mne/report/report.py:1974: in add_ica
+    #    self._add_ica(
+    #../python_env/lib/python3.10/site-packages/mne/report/report.py:1872: in _add_ica
+    #    self._add_ica_artifact_sources(
+    #../python_env/lib/python3.10/site-packages/mne/report/report.py:1713:
+    #  in _add_ica_artifact_sources
+    #    self._add_figure(
+    always:constrained_layout not applied.*:UserWarning
+    ignore:datetime\.datetime\.utcfromtimestamp.*:DeprecationWarning
+    ignore:datetime\.datetime\.utcnow.*:DeprecationWarning
+    # pandas with no good workaround
+    ignore:The behavior of DataFrame concatenation with empty.*:FutureWarning
+    # joblib on Windows sometimes
+    ignore:Persisting input arguments took.*:UserWarning
+    # matplotlib needs to update
+    ignore:Conversion of an array with ndim.*:DeprecationWarning
+    # scipy
+    ignore:nperseg .* is greater.*:UserWarning
+    # NumPy 2.0
+    ignore:__array_wrap__ must accept context.*:DeprecationWarning
+    ignore:__array__ implementation doesn't accept.*:DeprecationWarning
+    # Seaborn
+    ignore:.*bool was deprecated in Matplotlib.*:DeprecationWarning
     """
     for warning_line in warning_lines.split("\n"):
         warning_line = warning_line.strip()

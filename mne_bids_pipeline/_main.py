@@ -1,16 +1,16 @@
 import argparse
 import pathlib
-from textwrap import dedent
 import time
-from typing import List
+from textwrap import dedent
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
 
-from ._config_utils import _get_step_modules
 from ._config_import import _import_config
 from ._config_template import create_template_config
-from ._logging import logger, gen_log_kwargs
+from ._config_utils import _get_step_modules
+from ._logging import gen_log_kwargs, logger
+from ._parallel import get_parallel_backend
 from ._run import _short_step_path
 
 
@@ -36,7 +36,7 @@ def main():
         metavar="FILE",
         help="Create a template configuration file with the specified name. "
         "If specified, all other parameters will be ignored.",
-    ),
+    )
     parser.add_argument(
         "--steps",
         dest="steps",
@@ -57,6 +57,18 @@ def main():
         dest="root_dir",
         default=None,
         help="BIDS root directory of the data to process.",
+    )
+    parser.add_argument(
+        "--deriv_root",
+        dest="deriv_root",
+        default=None,
+        help=dedent(
+            """\
+        The root of the derivatives directory
+        in which the pipeline will store the processing results.
+        If unspecified, this will be derivatives/mne-bids-pipeline
+        inside the BIDS root."""
+        ),
     )
     parser.add_argument(
         "--subject", dest="subject", default=None, help="The subject to process."
@@ -82,7 +94,11 @@ def main():
         help="Enable interactive mode.",
     )
     parser.add_argument(
-        "--debug", dest="debug", action="store_true", help="Enable debugging on error."
+        "--debug",
+        "--pdb",
+        dest="debug",
+        action="store_true",
+        help="Enable debugging on error.",
     )
     parser.add_argument(
         "--no-cache",
@@ -114,6 +130,7 @@ def main():
         )
     steps = options.steps
     root_dir = options.root_dir
+    deriv_root = options.deriv_root
     subject, session = options.subject, options.session
     task, run = options.task, options.run
     n_jobs = options.n_jobs
@@ -128,7 +145,6 @@ def main():
         steps = (steps,)
 
     on_error = "debug" if debug else None
-    cache = "1" if cache else "0"
 
     processing_stages = []
     processing_steps = []
@@ -147,6 +163,10 @@ def main():
     overrides = SimpleNamespace()
     if root_dir:
         overrides.bids_root = pathlib.Path(root_dir).expanduser().resolve(strict=True)
+    if deriv_root:
+        overrides.deriv_root = (
+            pathlib.Path(deriv_root).expanduser().resolve(strict=False)
+        )
     if subject:
         overrides.subjects = [subject]
     if session:
@@ -164,7 +184,7 @@ def main():
     if not cache:
         overrides.memory_location = False
 
-    step_modules: List[ModuleType] = []
+    step_modules: list[ModuleType] = []
     STEP_MODULES = _get_step_modules()
     for stage, step in zip(processing_stages, processing_steps):
         if stage not in STEP_MODULES.keys():
@@ -193,22 +213,24 @@ def main():
         # them twice.
         step_modules = [*STEP_MODULES["init"], *step_modules]
 
-    msg = "Welcome aboard the MNE BIDS Pipeline!"
-    logger.info(**gen_log_kwargs(message=msg, emoji="👋", box="╶╴", step=""))
+    logger.title("Welcome aboard MNE-BIDS-Pipeline! 👋")
     msg = f"Using configuration: {config}"
-    logger.info(**gen_log_kwargs(message=msg, emoji="🧾", box="╶╴", step=""))
-
+    __mne_bids_pipeline_step__ = pathlib.Path(__file__)  # used for logging
+    logger.info(**gen_log_kwargs(message=msg, emoji="📝"))
     config_imported = _import_config(
         config_path=config_path,
         overrides=overrides,
     )
-    for si, step_module in enumerate(step_modules):
+    # Initialize dask now
+    with get_parallel_backend(config_imported.exec_params):
+        pass
+    del __mne_bids_pipeline_step__
+    logger.end()
+
+    for step_module in step_modules:
         start = time.time()
         step = _short_step_path(pathlib.Path(step_module.__file__))
-        if si == 0:
-            logger.rule()
-        msg = "Now running  👇"
-        logger.info(**gen_log_kwargs(message=msg, box="┌╴", emoji="🚀", step=step))
+        logger.title(title=f"{step}")
         step_module.main(config=config_imported)
         elapsed = time.time() - start
         hours, remainder = divmod(elapsed, 3600)
@@ -221,6 +243,4 @@ def main():
             elapsed = f"{minutes}m {elapsed}"
         if hours:
             elapsed = f"{hours}h {elapsed}"
-        msg = f"Done running  👆 [{elapsed}]"
-        logger.info(**gen_log_kwargs(message=msg, box="└╴", emoji="🎉", step=step))
-        logger.rule()
+        logger.end(f"done ({elapsed})")

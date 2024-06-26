@@ -4,29 +4,41 @@ import difflib
 import importlib
 import os
 import pathlib
+from dataclasses import field
+from functools import partial
 from types import SimpleNamespace
-from typing import Optional, List
 
 import matplotlib
-import numpy as np
 import mne
-from mne.utils import _check_option, _validate_type
+import numpy as np
+from pydantic import BaseModel, ConfigDict, ValidationError
 
-from ._logging import logger, gen_log_kwargs
+from ._logging import gen_log_kwargs, logger
 from .typing import PathLike
 
 
 def _import_config(
     *,
-    config_path: Optional[PathLike],
-    overrides: Optional[SimpleNamespace] = None,
+    config_path: PathLike | None,
+    overrides: SimpleNamespace | None = None,
     check: bool = True,
     log: bool = True,
 ) -> SimpleNamespace:
     """Import the default config and the user's config."""
     # Get the default
     config = _get_default_config()
+    # Public names users generally will have in their config
     valid_names = [d for d in dir(config) if not d.startswith("_")]
+    # Names that we will reduce the SimpleConfig to before returning
+    # (see _update_with_user_config)
+    keep_names = [d for d in dir(config) if not d.startswith("__")] + [
+        "config_path",
+        "PIPELINE_NAME",
+        "VERSION",
+        "CODE_URL",
+        "_raw_split_size",
+        "_epochs_split_size",
+    ]
 
     # Update with user config
     user_names = _update_with_user_config(
@@ -36,15 +48,30 @@ def _import_config(
         log=log,
     )
 
+    extra_exec_params_keys = ()
+    extra_config = os.getenv("_MNE_BIDS_STUDY_TESTING_EXTRA_CONFIG", "")
+    if extra_config:
+        msg = f"With testing config: {extra_config}"
+        logger.info(**gen_log_kwargs(message=msg, emoji="override"))
+        _update_config_from_path(
+            config=config,
+            config_path=extra_config,
+        )
+        extra_exec_params_keys = ("_n_jobs",)
+    keep_names.extend(extra_exec_params_keys)
+
     # Check it
     if check:
-        _check_config(config)
+        _check_config(config, config_path)
         _check_misspellings_removals(
-            config,
             valid_names=valid_names,
             user_names=user_names,
             log=log,
+            config_validation=config.config_validation,
         )
+
+    # Finally, reduce to our actual supported params (all keep_names should be present)
+    config = SimpleNamespace(**{k: getattr(config, k) for k in keep_names})
 
     # Take some standard actions
     mne.set_log_level(verbose=config.mne_log_level.upper())
@@ -64,12 +91,13 @@ def _import_config(
         "interactive",
         # Caching
         "memory_location",
+        "memory_subdir",
         "memory_verbose",
         "memory_file_method",
         # Misc
         "deriv_root",
         "config_path",
-    )
+    ) + extra_exec_params_keys
     in_both = {"deriv_root"}
     exec_params = SimpleNamespace(**{k: getattr(config, k) for k in keys})
     for k in keys:
@@ -89,7 +117,7 @@ def _get_default_config():
     ignore_keys = {
         name.asname or name.name
         for element in tree.body
-        if isinstance(element, (ast.Import, ast.ImportFrom))
+        if isinstance(element, ast.Import | ast.ImportFrom)
         for name in element.names
     }
     config = SimpleNamespace(
@@ -102,13 +130,39 @@ def _get_default_config():
     return config
 
 
+def _update_config_from_path(
+    *,
+    config: SimpleNamespace,
+    config_path: PathLike,
+):
+    user_names = list()
+    config_path = pathlib.Path(config_path).expanduser().resolve(strict=True)
+    # Import configuration from an arbitrary path without having to fiddle
+    # with `sys.path`.
+    spec = importlib.util.spec_from_file_location(
+        name="custom_config", location=config_path
+    )
+    custom_cfg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(custom_cfg)
+    for key in dir(custom_cfg):
+        if not key.startswith("__"):
+            # don't validate private vars, but do add to config
+            # (e.g., so that our hidden _raw_split_size is included)
+            if not key.startswith("_"):
+                user_names.append(key)
+            val = getattr(custom_cfg, key)
+            logger.debug(f"Overwriting: {key} -> {val}")
+            setattr(config, key, val)
+    return user_names
+
+
 def _update_with_user_config(
     *,
     config: SimpleNamespace,  # modified in-place
-    config_path: Optional[PathLike],
-    overrides: Optional[SimpleNamespace],
+    config_path: PathLike | None,
+    overrides: SimpleNamespace | None,
     log: bool = False,
-) -> List[str]:
+) -> list[str]:
     # 1. Basics and hidden vars
     from . import __version__
 
@@ -121,23 +175,12 @@ def _update_with_user_config(
     # 2. User config
     user_names = list()
     if config_path is not None:
-        config_path = pathlib.Path(config_path).expanduser().resolve(strict=True)
-        # Import configuration from an arbitrary path without having to fiddle
-        # with `sys.path`.
-        spec = importlib.util.spec_from_file_location(
-            name="custom_config", location=config_path
+        user_names.extend(
+            _update_config_from_path(
+                config=config,
+                config_path=config_path,
+            )
         )
-        custom_cfg = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(custom_cfg)
-        for key in dir(custom_cfg):
-            if not key.startswith("__"):
-                # don't validate private vars, but do add to config
-                # (e.g., so that our hidden _raw_split_size is included)
-                if not key.startswith("_"):
-                    user_names.append(key)
-                val = getattr(custom_cfg, key)
-                logger.debug("Overwriting: %s -> %s" % (key, val))
-                setattr(config, key, val)
     config.config_path = config_path
 
     # 3. Overrides via command-line switches
@@ -147,9 +190,7 @@ def _update_with_user_config(
             val = getattr(overrides, name)
             if log:
                 msg = f"Overriding config.{name} = {repr(val)}"
-                logger.info(
-                    **gen_log_kwargs(message=msg, step="", emoji="override", box="╶╴")
-                )
+                logger.info(**gen_log_kwargs(message=msg, emoji="override"))
             setattr(config, name, val)
 
     # 4. Env vars and other triaging
@@ -168,7 +209,7 @@ def _update_with_user_config(
     config.deriv_root = pathlib.Path(config.deriv_root).expanduser().resolve()
 
     # 5. Consistency
-    log_kwargs = dict(emoji="override", box="  ", step="")
+    log_kwargs = dict(emoji="override")
     if config.interactive:
         if log and config.on_error != "debug":
             msg = 'Setting config.on_error="debug" because of interactive mode'
@@ -191,10 +232,11 @@ def _update_with_user_config(
     return user_names
 
 
-def _check_config(config: SimpleNamespace) -> None:
-    # TODO: Use pydantic to do these validations
-    # https://github.com/mne-tools/mne-bids-pipeline/issues/646
-    _check_option("config.parallel_backend", config.parallel_backend, ("dask", "loky"))
+def _check_config(config: SimpleNamespace, config_path: PathLike | None) -> None:
+    _pydantic_validate(config=config, config_path=config_path)
+
+    # Eventually all of these could be pydantic-validated, but for now we'll
+    # just change the ones that are easy
 
     config.bids_root.resolve(strict=True)
 
@@ -207,12 +249,6 @@ def _check_config(config: SimpleNamespace) -> None:
     reject = config.reject
     ica_reject = config.ica_reject
     if config.spatial_filter == "ica":
-        _check_option(
-            "config.ica_algorithm",
-            config.ica_algorithm,
-            ("picard", "fastica", "extended_infomax"),
-        )
-
         if config.ica_l_freq < 1:
             raise ValueError(
                 "You requested to high-pass filter the data before ICA with "
@@ -235,7 +271,7 @@ def _check_config(config: SimpleNamespace) -> None:
         if (
             ica_reject is not None
             and reject is not None
-            and reject != "autoreject_global"
+            and reject not in ["autoreject_global", "autoreject_local"]
         ):
             for ch_type in reject:
                 if ch_type in ica_reject and reject[ch_type] > ica_reject[ch_type]:
@@ -245,30 +281,6 @@ def _check_config(config: SimpleNamespace) -> None:
                         "as that in "
                         f'ica_reject["{ch_type}"] ({ica_reject[ch_type]})'
                     )
-
-    if not config.ch_types:
-        raise ValueError("Please specify ch_types in your configuration.")
-
-    _VALID_TYPES = ("meg", "mag", "grad", "eeg")
-    if any(ch_type not in _VALID_TYPES for ch_type in config.ch_types):
-        raise ValueError(
-            "Invalid channel type passed. Please adjust `ch_types` in your "
-            f"configuration, got {config.ch_types} but supported types are "
-            f"{_VALID_TYPES}"
-        )
-
-    _check_option("config.on_error", config.on_error, ("continue", "abort", "debug"))
-    _check_option(
-        "config.memory_file_method", config.memory_file_method, ("mtime", "hash")
-    )
-
-    if isinstance(config.noise_cov, str):
-        _check_option(
-            "config.noise_cov",
-            config.noise_cov,
-            ("emptyroom", "ad-hoc", "rest"),
-            extra="when a string",
-        )
 
     if config.noise_cov == "emptyroom" and "eeg" in config.ch_types:
         raise ValueError(
@@ -286,10 +298,6 @@ def _check_config(config: SimpleNamespace) -> None:
             "Please set process_empty_room = True"
         )
 
-    _check_option(
-        "config.bem_mri_images", config.bem_mri_images, ("FLASH", "T1", "auto")
-    )
-
     bl = config.baseline
     if bl is not None:
         if (bl[0] is not None and bl[0] < config.epochs_tmin) or (
@@ -306,16 +314,7 @@ def _check_config(config: SimpleNamespace) -> None:
                 f"but you set baseline={bl}"
             )
 
-    # check decoding parameters
-    if config.decoding_n_splits < 2:
-        raise ValueError("decoding_n_splits should be at least 2.")
-
     # check cluster permutation parameters
-    if not 0 < config.cluster_permutation_p_threshold < 1:
-        raise ValueError(
-            "cluster_permutation_p_threshold should be in the (0, 1) interval."
-        )
-
     if config.cluster_n_permutations < 10 / config.cluster_permutation_p_threshold:
         raise ValueError(
             "cluster_n_permutations is not big enough to calculate "
@@ -330,38 +329,91 @@ def _check_config(config: SimpleNamespace) -> None:
             "This is only allowed for resting-state analysis."
         )
 
-    _check_option(
-        "config.on_rename_missing_events",
-        config.on_rename_missing_events,
-        ("raise", "warn", "ignore"),
-    )
-
-    _validate_type(config.n_jobs, int, "n_jobs")
-
-    _check_option(
-        "config.config_validation",
-        config.config_validation,
-        ("raise", "warn", "ignore"),
-    )
-
-    _validate_type(
-        config.mf_destination,
-        (str, list, tuple, np.ndarray),
-        "config.mf_destination",
-    )
-    if isinstance(config.mf_destination, str):
-        _check_option(
-            "config.mf_destination",
-            config.mf_destination,
-            ("reference_run",),
-        )
-    else:
+    if not isinstance(config.mf_destination, str):
         destination = np.array(config.mf_destination, float)
         if destination.shape != (4, 4):
             raise ValueError(
                 "config.mf_destination, if array-like, must have shape (4, 4) "
                 f"but got shape {destination.shape}"
             )
+
+# From: https://github.com/mne-tools/mne-bids-pipeline/pull/812
+    # MNE-ICALabel
+    if config.ica_use_icalabel:
+        if config.ica_l_freq != 1.0 or config.h_freq != 100.0:
+            raise ValueError(
+                f"When using MNE-ICALabel, you must set ica_l_freq=1 and h_freq=100, "
+                f"but got: ica_l_freq={config.ica_l_freq} and h_freq={config.h_freq}"
+            )
+
+        if config.eeg_reference != "average":
+            raise ValueError(
+                f'When using MNE-ICALabel, you must set eeg_reference="average", but '
+                f"got: eeg_reference={config.eeg_reference}"
+            )
+
+def _default_factory(key, val):
+    # convert a default to a default factory if needed, having an explicit
+    # allowlist of non-empty ones
+    allowlist = [
+        {"n_mag": 1, "n_grad": 1, "n_eeg": 1},  # n_proj_*
+        {"custom": (8, 24.0, 40)},  # decoding_csp_freqs
+        ["evoked"],  # inverse_targets
+        [4, 8, 16],  # autoreject_n_interpolate
+        #["brain", "muscle artifact", "eye blink", "heart beat", "line noise", "channel noise", "other"], # icalabel_include
+        ["brain","other"]
+    ]
+    for typ in (dict, list):
+        if isinstance(val, typ):
+            try:
+                idx = allowlist.index(val)
+            except ValueError:
+                assert val == typ(), (key, val)
+                default_factory = typ
+            else:
+                if typ is dict:
+                    default_factory = partial(typ, **allowlist[idx])
+                else:
+                    assert typ is list
+                    default_factory = partial(typ, allowlist[idx])
+            return field(default_factory=default_factory)
+    return val
+
+
+def _pydantic_validate(
+    config: SimpleNamespace,
+    config_path: PathLike | None,
+):
+    """Create dataclass from config type hints and validate with pydantic."""
+    # https://docs.pydantic.dev/latest/usage/dataclasses/
+    from . import _config as root_config
+
+    # Modify annotations to add nested strict parsing
+    annotations = dict()
+    attrs = dict()
+    for key, annot in root_config.__annotations__.items():
+        annotations[key] = annot
+        attrs[key] = _default_factory(key, root_config.__dict__[key])
+    name = "user configuration"
+    if config_path is not None:
+        name += f" from {config_path}"
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,  # needed in 2.6.0 to allow DigMontage for example
+        validate_assignment=True,
+        strict=True,  # do not allow float for int for example
+        extra="forbid",
+    )
+    UserConfig = type(
+        name,
+        (BaseModel,),
+        {"__annotations__": annotations, "model_config": model_config, **attrs},
+    )
+    # Now use pydantic to automagically validate
+    user_vals = {key: val for key, val in config.__dict__.items() if key in annotations}
+    try:
+        UserConfig.model_validate(user_vals)
+    except ValidationError as err:
+        raise ValueError(str(err)) from None
 
 
 _REMOVED_NAMES = {
@@ -379,15 +431,18 @@ _REMOVED_NAMES = {
     "N_JOBS": dict(
         new_name="n_jobs",
     ),
+    "ica_ctps_ecg_threshold": dict(
+        new_name="ica_ecg_threshold",
+    ),
 }
 
 
 def _check_misspellings_removals(
-    config: SimpleNamespace,
     *,
-    valid_names: List[str],
-    user_names: List[str],
+    valid_names: list[str],
+    user_names: list[str],
     log: bool,
+    config_validation: str,
 ) -> None:
     # for each name in the user names, check if it's in the valid names but
     # the correct one is not defined
@@ -396,7 +451,7 @@ def _check_misspellings_removals(
         if user_name not in valid_names:
             # find the closest match
             closest_match = difflib.get_close_matches(user_name, valid_names, n=1)
-            msg = f"Found a variable named {repr(user_name)} in your custom " "config,"
+            msg = f"Found a variable named {repr(user_name)} in your custom config,"
             if closest_match and closest_match[0] not in user_names:
                 this_msg = (
                     f"{msg} did you mean {repr(closest_match[0])}? "
@@ -404,7 +459,7 @@ def _check_misspellings_removals(
                     "the variable to reduce ambiguity and avoid this message, "
                     "or set config.config_validation to 'warn' or 'ignore'."
                 )
-                _handle_config_error(this_msg, log, config)
+                _handle_config_error(this_msg, log, config_validation)
             if user_name in _REMOVED_NAMES:
                 new = _REMOVED_NAMES[user_name]["new_name"]
                 if new not in user_names:
@@ -415,16 +470,16 @@ def _check_misspellings_removals(
                         f"{msg} this variable has been removed as a valid "
                         f"config option, {instead}."
                     )
-                    _handle_config_error(this_msg, log, config)
+                    _handle_config_error(this_msg, log, config_validation)
 
 
 def _handle_config_error(
     msg: str,
     log: bool,
-    config: SimpleNamespace,
+    config_validation: str,
 ) -> None:
-    if config.config_validation == "raise":
+    if config_validation == "raise":
         raise ValueError(msg)
-    elif config.config_validation == "warn":
+    elif config_validation == "warn":
         if log:
-            logger.warning(**gen_log_kwargs(message=msg, step="", emoji="🛟"))
+            logger.warning(**gen_log_kwargs(message=msg, emoji="🛟"))

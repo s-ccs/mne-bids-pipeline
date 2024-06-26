@@ -1,7 +1,6 @@
-"""
-ERP CORE
+"""ERP CORE.
 
-This example demonstrate how to process 5 participants from the
+This example demonstrates how to process 5 participants from the
 [ERP CORE](https://erpinfo.org/erp-core) dataset. It shows how to obtain 7 ERP
 components from a total of 6 experimental tasks:
 
@@ -23,11 +22,12 @@ components from a total of 6 experimental tasks:
                 event-related potential research. *NeuroImage* 225: 117465.
                 [https://doi.org/10.1016/j.neuroimage.2020.117465](https://doi.org/10.1016/j.neuroimage.2020.117465)
 """
+
 import argparse
-import mne
 import sys
 
-study_name = "ERP-CORE"
+import mne
+
 bids_root = "~/mne_data/ERP_CORE"
 deriv_root = "~/mne_data/derivatives/mne-bids-pipeline/ERP_CORE"
 
@@ -47,6 +47,8 @@ ch_types = ["eeg"]
 interactive = False
 
 raw_resample_sfreq = 128
+# Suppress "Data file name in EEG.data (sub-019_task-ERN_eeg.fdt) is incorrect..."
+read_raw_bids_verbose = "error"
 
 eeg_template_montage = mne.channels.make_standard_montage("standard_1005")
 eeg_bipolar_channels = {
@@ -69,20 +71,34 @@ min_break_duration = 10
 t_break_annot_start_after_previous_event = 3.0
 t_break_annot_stop_before_next_event = 1.5
 
-ica_reject = dict(eeg=350e-6, eog=500e-6)
-reject = "autoreject_global"
+if task == "N400":  # test autoreject local without ICA
+    spatial_filter = None
+    reject = "autoreject_local"
+    autoreject_n_interpolate = [2, 4]
+elif task == "N170":  # test autoreject local before ICA, and MNE-ICALabel
+    spatial_filter = "ica"
+    ica_algorithm = "picard-extended_infomax"
+    ica_use_icalabel = True
+    ica_l_freq = 1
+    h_freq = 100
+    ica_reject = "autoreject_local"
+    reject = "autoreject_global"
+    autoreject_n_interpolate = [12] # only for testing!
+else:
+    spatial_filter = "ica"
+    ica_reject = dict(eeg=350e-6, eog=500e-6)
+    reject = "autoreject_global"
 
-spatial_filter = "ica"
+# These settings are only used for the cases where spatial_filter="ica"
 ica_max_iterations = 1000
 ica_eog_threshold = 2
 ica_decim = 2  # speed up ICA fitting
 
 run_source_estimation = False
-
 on_rename_missing_events = "ignore"
 
 parallel_backend = "dask"
-dask_worker_memory_limit = "2G"
+dask_worker_memory_limit = "2.5G"
 n_jobs = 4
 
 if task == "N400":
@@ -102,7 +118,6 @@ if task == "N400":
     }
 
     eeg_reference = ["P9", "P10"]
-    ica_n_components = 30 - len(eeg_reference)
     epochs_tmin = -0.2
     epochs_tmax = 0.8
     epochs_metadata_tmin = 0
@@ -136,7 +151,6 @@ elif task == "ERN":
     }
 
     eeg_reference = ["P9", "P10"]
-    ica_n_components = 30 - len(eeg_reference)
     epochs_tmin = -0.6
     epochs_tmax = 0.4
     baseline = (-0.4, -0.2)
@@ -169,7 +183,6 @@ elif task == "LRP":
     }
 
     eeg_reference = ["P9", "P10"]
-    ica_n_components = 30 - len(eeg_reference)
     epochs_tmin = -0.8
     epochs_tmax = 0.2
     baseline = (None, -0.6)
@@ -182,7 +195,6 @@ elif task == "MMN":
     }
 
     eeg_reference = ["P9", "P10"]
-    ica_n_components = 30 - len(eeg_reference)
     epochs_tmin = -0.2
     epochs_tmax = 0.8
     baseline = (None, 0)
@@ -203,7 +215,41 @@ elif task == "N2pc":
     }
 
     eeg_reference = ["P9", "P10"]
-    ica_n_components = 30 - len(eeg_reference)
+    # Analyze all EEG channels -- we only specify the channels here for the purpose of
+    # demonstration
+    analyze_channels = [
+        "FP1",
+        "F3",
+        "F7",
+        "FC3",
+        "C3",
+        "C5",
+        "P3",
+        "P7",
+        "P9",
+        "PO7",
+        "PO3",
+        "O1",
+        "Oz",
+        "Pz",
+        "CPz",
+        "FP2",
+        "Fz",
+        "F4",
+        "F8",
+        "FC4",
+        "FCz",
+        "Cz",
+        "C4",
+        "C6",
+        "P4",
+        "P8",
+        "P10",
+        "PO8",
+        "PO4",
+        "O2",
+    ]
+
     epochs_tmin = -0.2
     epochs_tmax = 0.8
     baseline = (None, 0)
@@ -216,6 +262,41 @@ elif task == "N170":
     }
 
     eeg_reference = "average"
+    # Analyze all EEG channels -- we only specify the channels here for the purpose of
+    # demonstration
+    analyze_channels = [
+        "FP1",
+        "F3",
+        "F7",
+        "FC3",
+        "C3",
+        "C5",
+        "P3",
+        "P7",
+        "P9",
+        "PO7",
+        "PO3",
+        "O1",
+        "Oz",
+        "Pz",
+        "CPz",
+        "FP2",
+        "Fz",
+        "F4",
+        "F8",
+        "FC4",
+        "FCz",
+        "Cz",
+        "C4",
+        "C6",
+        "P4",
+        "P8",
+        "P10",
+        "PO8",
+        "PO4",
+        "O2",
+    ]
+
     ica_n_components = 30 - 1
     for i in range(1, 180 + 1):
         orig_name = f"stimulus/{i}"
@@ -270,7 +351,6 @@ elif task == "P3":
     }
 
     eeg_reference = ["P9", "P10"]
-    ica_n_components = 30 - len(eeg_reference)
     epochs_tmin = -0.2
     epochs_tmax = 0.8
     baseline = (None, 0)

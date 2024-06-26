@@ -1,26 +1,29 @@
 #!/usr/bin/env python
 
-from collections import defaultdict
+"""Generate documentation pages for our examples gallery."""
+
 import contextlib
 import logging
 import shutil
-from pathlib import Path
 import sys
-from typing import Union, Iterable
+from collections import defaultdict
+from collections.abc import Iterable
+from pathlib import Path
+
+from tqdm import tqdm
 
 import mne_bids_pipeline
-from mne_bids_pipeline._config_import import _import_config
 import mne_bids_pipeline.tests.datasets
-from mne_bids_pipeline.tests.test_run import TEST_SUITE
+from mne_bids_pipeline._config_import import _import_config
 from mne_bids_pipeline.tests.datasets import DATASET_OPTIONS
-from tqdm import tqdm
+from mne_bids_pipeline.tests.test_run import TEST_SUITE
 
 this_dir = Path(__file__).parent
 root = Path(mne_bids_pipeline.__file__).parent.resolve(strict=True)
 logger = logging.getLogger()
 
 
-def _bool_to_icon(x: Union[bool, Iterable]) -> str:
+def _bool_to_icon(x: bool | Iterable) -> str:
     if x:
         return "✅"
     else:
@@ -61,6 +64,8 @@ def _gen_demonstrated_funcs(example_config_path: Path) -> dict:
         key = "Maxwell filter"
         funcs[key] = funcs[key] or config.use_maxwell_filter
         funcs["Frequency filter"] = config.l_freq or config.h_freq
+        key = "Artifact regression"
+        funcs[key] = funcs[key] or (config.regress_artifact is not None)
         key = "SSP"
         funcs[key] = funcs[key] or (config.spatial_filter == "ssp")
         key = "ICA"
@@ -104,6 +109,18 @@ for test_name, test_dataset_options in TEST_SUITE.items():
         datasets_without_html.append(dataset_name)
         continue
 
+    # For ERP_CORE, cut down on what we show otherwise our website is huge
+    if "ERP_CORE" in test_name:
+        show = ["015", "average"]
+        orig_fnames = html_report_fnames
+        html_report_fnames = [
+            f
+            for f in html_report_fnames
+            if any(f"sub-{s}" in f.parts and f"sub-{s}" in f.name for s in show)
+        ]
+        assert len(html_report_fnames), orig_fnames
+        del orig_fnames
+
     fname_iter = tqdm(
         html_report_fnames,
         desc=f"  {test_name}",
@@ -133,7 +150,7 @@ for test_dataset_name, test_dataset_options in ds_iter:
     )
     if dataset_name in all_demonstrated:
         logger.warning(
-            f"Duplicate dataset name {test_dataset_name} -> {dataset_name}, " "skipping"
+            f"Duplicate dataset name {test_dataset_name} -> {dataset_name}, skipping"
         )
         continue
     del test_dataset_options, test_dataset_name
@@ -142,7 +159,8 @@ for test_dataset_name, test_dataset_options in ds_iter:
         logger.warning(f"Dataset {dataset_name} has no HTML report.")
         continue
 
-    options = DATASET_OPTIONS[dataset_options_key]
+    assert dataset_options_key in DATASET_OPTIONS, dataset_options_key
+    options = DATASET_OPTIONS[dataset_options_key].copy()  # we modify locally
 
     report_str = "\n## Generated output\n\n"
     example_target_dir = this_dir / dataset_name
@@ -198,20 +216,22 @@ for test_dataset_name, test_dataset_options in ds_iter:
             f"{fname.name} :fontawesome-solid-square-poll-vertical:</a>\n\n"
         )
 
-    if options["openneuro"]:
+    assert sum(key in options for key in ("openneuro", "web", "mne")) == 1
+    if "openneuro" in options:
         url = f'https://openneuro.org/datasets/{options["openneuro"]}'
-    elif options["git"]:
-        url = options["git"]
-    elif options["web"]:
+    elif "web" in options:
         url = options["web"]
     else:
-        url = ""
+        assert "mne" in options
+        url = f"https://mne.tools/dev/generated/mne.datasets.{options['mne']}.data_path.html"  # noqa: E501
 
     source_str = (
         f"## Dataset source\n\nThis dataset was acquired from " f"[{url}]({url})\n"
     )
 
-    if options["openneuro"]:
+    if "openneuro" in options:
+        for key in ("include", "exclude"):
+            options[key] = options.get(key, [])
         download_str = (
             f'\n??? example "How to download this dataset"\n'
             f"    Run in your terminal:\n"
@@ -240,7 +260,9 @@ for test_dataset_name, test_dataset_options in ds_iter:
 
     # TODO: For things like ERP_CORE_ERN, decoding_csp are not populated
     # properly by the root config
-    config_path = root / "tests" / "configs" / f"config_{dataset_name}.py"
+    config_path = (
+        root / "tests" / "configs" / f"config_{dataset_name.replace('-', '_')}.py"
+    )
     config = config_path.read_text(encoding="utf-8-sig").strip()
     descr_end_idx = config[2:].find('"""')
     config_descr = "# " + config[: descr_end_idx + 1].replace('"""', "").strip()
@@ -257,6 +279,7 @@ for test_dataset_name, test_dataset_options in ds_iter:
     demonstrated_funcs = _gen_demonstrated_funcs(config_path)
     all_demonstrated[dataset_name] = demonstrated_funcs
     del config, config_options
+    # Add the subsection and table header
     funcs = [
         "## Demonstrated features\n",
         "Feature | This example",
@@ -275,7 +298,7 @@ for test_dataset_name, test_dataset_options in ds_iter:
         f.write(config_str)
         f.write(report_str)
 
-# Finally, write our examples.html file
+# Finally, write our examples.html file with a table of examples
 
 _example_header = """\
 # Examples

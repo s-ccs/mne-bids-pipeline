@@ -5,37 +5,31 @@ The average power and inter-trial coherence are computed and saved to disk.
 """
 
 from types import SimpleNamespace
-from typing import Optional
-
-import numpy as np
 
 import mne
-
+import numpy as np
 from mne_bids import BIDSPath
 
 from ..._config_utils import (
-    get_sessions,
-    get_subjects,
-    get_eeg_reference,
-    sanitize_cond_name,
     _bids_kwargs,
     _restrict_analyze_channels,
+    get_eeg_reference,
+    get_sessions,
+    get_subjects,
+    sanitize_cond_name,
 )
 from ..._logging import gen_log_kwargs, logger
-from ..._run import failsafe_run, save_logs
 from ..._parallel import get_parallel_backend, parallel_func
 from ..._report import _open_report, _sanitize_cond_tag
+from ..._run import _prep_out_files, _update_for_splits, failsafe_run, save_logs
 
 
 def get_input_fnames_time_frequency(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
 ) -> dict:
-    processing = None
-    if cfg.spatial_filter is not None:
-        processing = "clean"
     fname_epochs = BIDSPath(
         subject=subject,
         session=session,
@@ -46,13 +40,14 @@ def get_input_fnames_time_frequency(
         space=cfg.space,
         datatype=cfg.datatype,
         root=cfg.deriv_root,
-        processing=processing,
+        processing="clean",
         suffix="epo",
         extension=".fif",
         check=False,
     )
     in_files = dict()
     in_files["epochs"] = fname_epochs
+    _update_for_splits(in_files, "epochs", single=True)
     return in_files
 
 
@@ -64,16 +59,17 @@ def run_time_frequency(
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
     in_files: dict,
 ) -> dict:
     import matplotlib.pyplot as plt
 
-    msg = f'Input: {in_files["epochs"].basename}'
+    epochs_path = in_files.pop("epochs")
+    msg = f"Reading {epochs_path.basename}"
     logger.info(**gen_log_kwargs(message=msg))
-    bids_path = in_files["epochs"].copy().update(processing=None)
-
-    epochs = mne.read_epochs(in_files.pop("epochs"))
+    epochs = mne.read_epochs(epochs_path)
+    bids_path = epochs_path.copy().update(processing=None, split=None)
+    del epochs_path
     _restrict_analyze_channels(epochs, cfg)
 
     if cfg.time_frequency_subtract_evoked:
@@ -87,6 +83,7 @@ def run_time_frequency(
 
     out_files = dict()
     for condition in cfg.time_frequency_conditions:
+        logger.info(**gen_log_kwargs(message=f"Computing TFR for {condition}"))
         this_epochs = epochs[condition]
         power, itc = mne.time_frequency.tfr_morlet(
             this_epochs, freqs=freqs, return_itc=True, n_cycles=time_frequency_cycles
@@ -106,8 +103,8 @@ def run_time_frequency(
         # conform to MNE filename checks. This is because BIDS has not
         # finalized how derivatives should be named. Once this is done, we
         # should update our names and/or MNE's checks.
-        power.save(out_files[power_key], overwrite=True, verbose="error")
-        itc.save(out_files[itc_key], overwrite=True, verbose="error")
+        power.save(out_files[power_key].fpath, overwrite=True, verbose="error")
+        itc.save(out_files[itc_key].fpath, overwrite=True, verbose="error")
 
     # Report
     with _open_report(
@@ -117,8 +114,8 @@ def run_time_frequency(
         logger.info(**gen_log_kwargs(message=msg))
         for condition in cfg.time_frequency_conditions:
             cond = sanitize_cond_name(condition)
-            fname_tfr_pow_cond = out_files[f"power-{cond}"]
-            fname_tfr_itc_cond = out_files[f"itc-{cond}"]
+            fname_tfr_pow_cond = out_files[f"power-{cond}"].fpath
+            fname_tfr_itc_cond = out_files[f"itc-{cond}"].fpath
             with mne.use_log_level("error"):  # filename convention
                 power = mne.time_frequency.read_tfrs(fname_tfr_pow_cond, condition=0)
                 power.apply_baseline(
@@ -153,7 +150,7 @@ def run_time_frequency(
             del itc
 
     assert len(in_files) == 0, in_files.keys()
-    return out_files
+    return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
 
 def get_config(
@@ -182,7 +179,7 @@ def main(*, config: SimpleNamespace) -> None:
     """Run Time-frequency decomposition."""
     if not config.time_frequency_conditions:
         msg = "Skipping …"
-        logger.info(**gen_log_kwargs(message=msg))
+        logger.info(**gen_log_kwargs(message=msg, emoji="skip"))
         return
 
     parallel, run_func = parallel_func(

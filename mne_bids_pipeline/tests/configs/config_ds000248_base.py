@@ -1,9 +1,7 @@
-"""
-MNE Sample Data: M/EEG combined processing
-"""
+"""MNE Sample Data: M/EEG combined processing."""
+
 import mne
 
-study_name = "ds000248"
 bids_root = "~/mne_data/ds000248"
 deriv_root = "~/mne_data/derivatives/mne-bids-pipeline/ds000248_base"
 subjects_dir = f"{bids_root}/derivatives/freesurfer/subjects"
@@ -21,13 +19,14 @@ mf_reference_run = "01"
 find_flat_channels_meg = True
 find_noisy_channels_meg = True
 use_maxwell_filter = True
-_raw_split_size = "60MB"  # hits both task-noise and task-audiovisual
-_epochs_split_size = "30MB"
 
 
 def noise_cov(bp):
+    """Estimate the noise covariance."""
     # Use pre-stimulus period as noise source
-    bp = bp.copy().update(processing="clean", suffix="epo")
+    bp = bp.copy().update(suffix="epo")
+    if not bp.fpath.exists():
+        bp.update(split="01")
     epo = mne.read_epochs(bp)
     cov = mne.compute_covariance(epo, rank="info", tmax=0)
     return cov
@@ -48,5 +47,6 @@ n_jobs = 2
 
 
 def mri_t1_path_generator(bids_path):
+    """Return the path to a T1 image."""
     # don't really do any modifications – just for testing!
     return bids_path

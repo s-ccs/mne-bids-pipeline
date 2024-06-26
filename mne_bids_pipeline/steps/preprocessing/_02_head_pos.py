@@ -1,33 +1,32 @@
 """Estimate head positions."""
 
-from typing import Optional
 from types import SimpleNamespace
 
 import mne
 
 from ..._config_utils import (
-    get_subjects,
-    get_sessions,
     get_runs_tasks,
+    get_sessions,
+    get_subjects,
 )
 from ..._import_data import (
-    import_experimental_data,
     _get_run_rest_noise_path,
     _import_data_kwargs,
+    import_experimental_data,
 )
 from ..._logging import gen_log_kwargs, logger
-from ..._parallel import parallel_func, get_parallel_backend
+from ..._parallel import get_parallel_backend, parallel_func
 from ..._report import _open_report
-from ..._run import failsafe_run, save_logs
+from ..._run import _prep_out_files, failsafe_run, save_logs
 
 
 def get_input_fnames_head_pos(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
-    run: Optional[str],
-    task: Optional[str],
+    session: str | None,
+    run: str | None,
+    task: str | None,
 ) -> dict:
     """Get paths of files required by run_head_pos function."""
     return _get_run_rest_noise_path(
@@ -49,9 +48,9 @@ def run_head_pos(
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
-    session: Optional[str],
-    run: Optional[str],
-    task: Optional[str],
+    session: str | None,
+    run: str | None,
+    task: str | None,
     in_files: dict,
 ) -> dict:
     import matplotlib.pyplot as plt
@@ -62,7 +61,8 @@ def run_head_pos(
     out_files = dict()
     key = f"raw_run-{run}-pos"
     out_files[key] = bids_path_in.copy().update(
-        extension=".pos",
+        suffix="headpos",
+        extension=".txt",
         root=cfg.deriv_root,
         check=False,
     )
@@ -140,14 +140,14 @@ def run_head_pos(
         plt.close(fig)
     del bids_path_in
     assert len(in_files) == 0, in_files.keys()
-    return out_files
+    return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
 
 def get_config(
     *,
     config: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
 ) -> SimpleNamespace:
     cfg = SimpleNamespace(
         mf_mc_t_step_min=config.mf_mc_t_step_min,
@@ -183,7 +183,7 @@ def main(*, config: SimpleNamespace) -> None:
                 config=config,
                 subject=subject,
                 session=session,
-                include_noise=False,
+                which=("runs", "rest"),
             )
         )
 

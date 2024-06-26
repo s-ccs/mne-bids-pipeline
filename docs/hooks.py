@@ -1,19 +1,31 @@
+"""Custom hooks for MkDocs-Material."""
+
 import logging
-from typing import Dict, Any
+from typing import Any
 
 from mkdocs.config.defaults import MkDocsConfig
-from mkdocs.structure.pages import Page
 from mkdocs.structure.files import Files
+from mkdocs.structure.pages import Page
+
+from mne_bids_pipeline._docs import _ParseConfigSteps
 
 logger = logging.getLogger("mkdocs")
 
 config_updated = False
 
 
+# This hack can be cleaned up once this is resolved:
+# https://github.com/mkdocstrings/mkdocstrings/issues/615#issuecomment-1971568301
+def on_pre_build(config: MkDocsConfig) -> None:
+    """Monkey patch mkdocstrings-python jinja template to have global vars."""
+    python_handler = config["plugins"]["mkdocstrings"].get_handler("python")
+    python_handler.env.globals["pipeline_steps"] = _ParseConfigSteps()
+
+
 # Ideally there would be a better hook, but it's unclear if context can
 # be obtained any earlier
 def on_template_context(
-    context: Dict[str, Any],
+    context: dict[str, Any],
     template_name: str,
     config: MkDocsConfig,
 ) -> None:
@@ -46,6 +58,7 @@ def on_page_markdown(
     config: MkDocsConfig,
     files: Files,
 ) -> str:
+    """Replace emojis."""
     if page.file.name == "index" and page.title == "Home":
         for rd, md in _EMOJI_MAP.items():
             markdown = markdown.replace(rd, md)

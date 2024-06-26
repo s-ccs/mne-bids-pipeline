@@ -3,38 +3,36 @@
 Compute and apply an inverse solution for each evoked data set.
 """
 
-import pathlib
 from types import SimpleNamespace
-from typing import Optional
 
 import mne
 from mne.minimum_norm import (
-    make_inverse_operator,
     apply_inverse,
+    make_inverse_operator,
     write_inverse_operator,
 )
 from mne_bids import BIDSPath
 
 from ..._config_utils import (
+    _bids_kwargs,
+    get_fs_subject,
+    get_fs_subjects_dir,
     get_noise_cov_bids_path,
+    get_sessions,
     get_subjects,
     sanitize_cond_name,
-    get_sessions,
-    get_fs_subjects_dir,
-    get_fs_subject,
-    _bids_kwargs,
 )
-from ..._logging import logger, gen_log_kwargs
+from ..._logging import gen_log_kwargs, logger
 from ..._parallel import get_parallel_backend, parallel_func
-from ..._report import _open_report, _sanitize_cond_tag
-from ..._run import failsafe_run, save_logs, _sanitize_callable
+from ..._report import _all_conditions, _open_report, _sanitize_cond_tag
+from ..._run import _prep_out_files, _sanitize_callable, failsafe_run, save_logs
 
 
 def get_input_fnames_inverse(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
 ):
     bids_path = BIDSPath(
         subject=subject,
@@ -50,7 +48,19 @@ def get_input_fnames_inverse(
         check=False,
     )
     in_files = dict()
-    in_files["info"] = bids_path.copy().update(**cfg.source_info_path_update)
+    # make sure the info matches the data from which the noise cov
+    # is computed to avoid rank-mismatch
+    if cfg.source_info_path_update is None:
+        if cfg.noise_cov in ("rest", "noise"):
+            source_info_path_update = dict(
+                processing="clean", suffix="raw", task=cfg.noise_cov
+            )
+        else:
+            source_info_path_update = dict(suffix="ave")
+            # XXX is this the right solution also for noise_cov = 'ad-hoc'?
+    else:
+        source_info_path_update = cfg.source_info_path_update
+    in_files["info"] = bids_path.copy().update(**source_info_path_update)
     in_files["forward"] = bids_path.copy().update(suffix="fwd")
     if cfg.noise_cov != "ad-hoc":
         in_files["cov"] = get_noise_cov_bids_path(
@@ -69,7 +79,7 @@ def run_inverse(
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
     in_files: dict,
 ) -> dict:
     # TODO: Eventually we should maybe loop over ch_types, e.g., to create
@@ -97,22 +107,18 @@ def run_inverse(
     # Apply inverse
     snr = 3.0
     lambda2 = 1.0 / snr**2
-
-    if isinstance(cfg.conditions, dict):
-        conditions = list(cfg.conditions.keys())
-    else:
-        conditions = cfg.conditions
-
+    conditions = _all_conditions(cfg=cfg)
     method = cfg.inverse_method
     if "evoked" in in_files:
         fname_ave = in_files.pop("evoked")
         evokeds = mne.read_evokeds(fname_ave)
 
         for condition, evoked in zip(conditions, evokeds):
-            pick_ori = None
-            cond_str = sanitize_cond_name(condition)
-            key = f"{cond_str}+{method}+hemi"
-            out_files[key] = fname_ave.copy().update(suffix=key, extension=None)
+            suffix = f"{sanitize_cond_name(condition)}+{method}+hemi"
+            out_files[condition] = fname_ave.copy().update(
+                suffix=suffix,
+                extension=".h5",
+            )
 
             if "eeg" in cfg.ch_types:
                 evoked.set_eeg_reference("average", projection=True)
@@ -122,10 +128,9 @@ def run_inverse(
                 inverse_operator=inverse_operator,
                 lambda2=lambda2,
                 method=method,
-                pick_ori=pick_ori,
+                pick_ori=None,
             )
-            stc.save(out_files[key], overwrite=True)
-            out_files[key] = pathlib.Path(str(out_files[key]) + "-lh.stc")
+            stc.save(out_files[condition], ftype="h5", overwrite=True)
 
         with _open_report(
             cfg=cfg, exec_params=exec_params, subject=subject, session=session
@@ -133,16 +138,13 @@ def run_inverse(
             msg = "Adding inverse information to report"
             logger.info(**gen_log_kwargs(message=msg))
             for condition in conditions:
-                cond_str = sanitize_cond_name(condition)
-                key = f"{cond_str}+{method}+hemi"
-                if key not in out_files:
-                    continue
                 msg = f"Rendering inverse solution for {condition}"
                 logger.info(**gen_log_kwargs(message=msg))
-                fname_stc = out_files[key]
                 tags = ("source-estimate", _sanitize_cond_tag(condition))
+                if condition not in cfg.conditions:
+                    tags = tags + ("contrast",)
                 report.add_stc(
-                    stc=fname_stc,
+                    stc=out_files[condition],
                     title=f"Source: {condition}",
                     subject=cfg.fs_subject,
                     subjects_dir=cfg.fs_subjects_dir,
@@ -152,7 +154,7 @@ def run_inverse(
                 )
 
     assert len(in_files) == 0, in_files
-    return out_files
+    return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
 
 def get_config(
@@ -165,6 +167,7 @@ def get_config(
         inverse_targets=config.inverse_targets,
         ch_types=config.ch_types,
         conditions=config.conditions,
+        contrasts=config.contrasts,
         loose=config.loose,
         depth=config.depth,
         inverse_method=config.inverse_method,

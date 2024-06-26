@@ -10,13 +10,13 @@ import mne
 
 from ..._config_utils import (
     _get_bem_conductivity,
-    get_fs_subjects_dir,
     get_fs_subject,
+    get_fs_subjects_dir,
     get_subjects,
 )
-from ..._logging import logger, gen_log_kwargs
-from ..._parallel import parallel_func, get_parallel_backend
-from ..._run import failsafe_run, save_logs
+from ..._logging import gen_log_kwargs, logger
+from ..._parallel import get_parallel_backend, parallel_func
+from ..._run import _prep_out_files, failsafe_run, save_logs
 
 
 def get_input_fnames_make_bem_solution(
@@ -69,7 +69,12 @@ def make_bem_solution(
     out_files = get_output_fnames_make_bem_solution(cfg=cfg, subject=subject)
     mne.write_bem_surfaces(out_files["model"], bem_model, overwrite=True)
     mne.write_bem_solution(out_files["sol"], bem_sol, overwrite=True)
-    return out_files
+    return _prep_out_files(
+        exec_params=exec_params,
+        out_files=out_files,
+        check_relative=cfg.fs_subjects_dir,
+        bids_only=False,
+    )
 
 
 def get_config(
@@ -94,7 +99,7 @@ def main(*, config) -> None:
         return
 
     if config.use_template_mri is not None:
-        msg = "Skipping, BEM solution computation not needed for " "MRI template …"
+        msg = "Skipping, BEM solution computation not needed for MRI template …"
         logger.info(**gen_log_kwargs(message=msg, emoji="skip"))
         if config.use_template_mri == "fsaverage":
             # Ensure we have the BEM

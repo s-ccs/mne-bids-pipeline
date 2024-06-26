@@ -3,35 +3,40 @@
 Covariance matrices are computed and saved.
 """
 
-from typing import Optional
 from types import SimpleNamespace
 
 import mne
 from mne_bids import BIDSPath
 
+from ..._config_import import _import_config
 from ..._config_utils import (
+    _bids_kwargs,
+    _restrict_analyze_channels,
+    get_eeg_reference,
+    get_noise_cov_bids_path,
     get_sessions,
     get_subjects,
-    get_noise_cov_bids_path,
-    _bids_kwargs,
 )
-from ..._config_import import _import_config
-from ..._config_utils import _restrict_analyze_channels, get_all_contrasts
 from ..._logging import gen_log_kwargs, logger
 from ..._parallel import get_parallel_backend, parallel_func
-from ..._report import _open_report, _sanitize_cond_tag, _all_conditions
-from ..._run import failsafe_run, save_logs, _sanitize_callable
+from ..._report import _all_conditions, _open_report, _sanitize_cond_tag
+from ..._run import (
+    _prep_out_files,
+    _sanitize_callable,
+    _update_for_splits,
+    failsafe_run,
+    save_logs,
+)
 
 
 def get_input_fnames_cov(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
 ) -> dict:
     cov_type = _get_cov_type(cfg)
     in_files = dict()
-    processing = "clean" if cfg.spatial_filter is not None else None
     fname_epochs = BIDSPath(
         subject=subject,
         session=session,
@@ -42,14 +47,13 @@ def get_input_fnames_cov(
         space=cfg.space,
         extension=".fif",
         suffix="epo",
-        processing=processing,
+        processing="clean",
         datatype=cfg.datatype,
         root=cfg.deriv_root,
         check=False,
     )
-    in_files["report_info"] = fname_epochs.copy().update(
-        processing="clean", suffix="epo"
-    )
+    in_files["report_info"] = fname_epochs.copy().update(processing="clean")
+    _update_for_splits(in_files, "report_info", single=True)
     fname_evoked = fname_epochs.copy().update(
         suffix="ave", processing=None, check=False
     )
@@ -67,15 +71,14 @@ def get_input_fnames_cov(
             run=None,
             recording=cfg.rec,
             space=cfg.space,
-            processing="filt",
+            processing="clean",
             suffix="raw",
             extension=".fif",
             datatype=cfg.datatype,
             root=cfg.deriv_root,
             check=False,
         )
-        run_type = "resting-state" if cfg.noise_cov == "rest" else "empty-room"
-        if run_type == "resting-state":
+        if cfg.noise_cov == "rest":
             bids_path_raw_noise.task = "rest"
         else:
             bids_path_raw_noise.task = "noise"
@@ -83,17 +86,18 @@ def get_input_fnames_cov(
     else:
         assert cov_type == "epochs", cov_type
         in_files["epochs"] = fname_epochs
+        _update_for_splits(in_files, "epochs", single=True)
     return in_files
 
 
 def compute_cov_from_epochs(
     *,
-    tmin: Optional[float],
-    tmax: Optional[float],
+    tmin: float | None,
+    tmax: float | None,
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
     in_files: dict,
     out_files: dict,
 ) -> mne.Covariance:
@@ -111,7 +115,7 @@ def compute_cov_from_epochs(
         epochs,
         tmin=tmin,
         tmax=tmax,
-        method="shrunk",
+        method=cfg.noise_cov_method,
         rank="info",
         verbose="error",  # TODO: not baseline corrected, maybe problematic?
     )
@@ -123,13 +127,13 @@ def compute_cov_from_raw(
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
     in_files: dict,
     out_files: dict,
 ) -> mne.Covariance:
     fname_raw = in_files.pop("raw")
-    run_type = "resting-state" if fname_raw.task == "rest" else "empty-room"
-    msg = f"Computing regularized covariance based on {run_type} recording."
+    run_msg = "resting-state" if fname_raw.task == "rest" else "empty-room"
+    msg = f"Computing regularized covariance based on {run_msg} recording."
     logger.info(**gen_log_kwargs(message=msg))
     msg = f"Input:  {fname_raw.basename}"
     logger.info(**gen_log_kwargs(message=msg))
@@ -146,7 +150,7 @@ def retrieve_custom_cov(
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
     in_files: dict,
     out_files: dict,
 ) -> mne.Covariance:
@@ -168,7 +172,7 @@ def retrieve_custom_cov(
         task=cfg.task,
         acquisition=cfg.acq,
         run=None,
-        processing=cfg.proc,
+        processing="clean",
         recording=cfg.rec,
         space=cfg.space,
         suffix="ave",
@@ -178,7 +182,7 @@ def retrieve_custom_cov(
         check=False,
     )
 
-    msg = "Retrieving noise covariance matrix from custom user-supplied " "function"
+    msg = "Retrieving noise covariance matrix from custom user-supplied function"
     logger.info(**gen_log_kwargs(message=msg))
     msg = f'Output: {out_files["cov"].basename}'
     logger.info(**gen_log_kwargs(message=msg))
@@ -207,7 +211,7 @@ def run_covariance(
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
-    session: Optional[str] = None,
+    session: str | None = None,
     in_files: dict,
 ) -> dict:
     import matplotlib.pyplot as plt
@@ -258,10 +262,8 @@ def run_covariance(
             for evoked, condition in zip(all_evoked, conditions):
                 _restrict_analyze_channels(evoked, cfg)
                 tags = ("evoked", "covariance", _sanitize_cond_tag(condition))
-                if condition in cfg.conditions:
-                    title = f"Whitening: {condition}"
-                else:  # It's a contrast of two conditions.
-                    title = f"Whitening: {condition}"
+                title = f"Whitening: {condition}"
+                if condition not in cfg.conditions:
                     tags = tags + ("contrast",)
                 fig = evoked.plot_white(cov, verbose="error")
                 report.add_figure(
@@ -274,7 +276,7 @@ def run_covariance(
                 plt.close(fig)
 
     assert len(in_files) == 0, in_files
-    return out_files
+    return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
 
 def get_config(
@@ -287,8 +289,10 @@ def get_config(
         run_source_estimation=config.run_source_estimation,
         noise_cov=_sanitize_callable(config.noise_cov),
         conditions=config.conditions,
-        all_contrasts=get_all_contrasts(config),
+        contrasts=config.contrasts,
         analyze_channels=config.analyze_channels,
+        eeg_reference=get_eeg_reference(config),
+        noise_cov_method=config.noise_cov_method,
         **_bids_kwargs(config=config),
     )
     return cfg

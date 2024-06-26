@@ -1,29 +1,36 @@
 """Extract evoked data for each condition."""
 
 from types import SimpleNamespace
-from typing import Optional
 
 import mne
 from mne_bids import BIDSPath
 
 from ..._config_utils import (
+    _bids_kwargs,
+    _pl,
+    _restrict_analyze_channels,
+    get_all_contrasts,
+    get_eeg_reference,
     get_sessions,
     get_subjects,
-    get_all_contrasts,
-    _bids_kwargs,
-    _restrict_analyze_channels,
 )
 from ..._logging import gen_log_kwargs, logger
-from ..._parallel import parallel_func, get_parallel_backend
-from ..._report import _open_report, _sanitize_cond_tag
-from ..._run import failsafe_run, save_logs, _sanitize_callable
+from ..._parallel import get_parallel_backend, parallel_func
+from ..._report import _all_conditions, _open_report, _sanitize_cond_tag
+from ..._run import (
+    _prep_out_files,
+    _sanitize_callable,
+    _update_for_splits,
+    failsafe_run,
+    save_logs,
+)
 
 
 def get_input_fnames_evoked(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
 ) -> dict:
     fname_epochs = BIDSPath(
         subject=subject,
@@ -42,6 +49,7 @@ def get_input_fnames_evoked(
     )
     in_files = dict()
     in_files["epochs"] = fname_epochs
+    _update_for_splits(in_files, "epochs", single=True)
     return in_files
 
 
@@ -53,12 +61,19 @@ def run_evoked(
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
     in_files: dict,
 ) -> dict:
     out_files = dict()
     out_files["evoked"] = (
-        in_files["epochs"].copy().update(suffix="ave", processing=None, check=False)
+        in_files["epochs"]
+        .copy()
+        .update(
+            suffix="ave",
+            processing=None,
+            check=False,
+            split=None,
+        )
     )
 
     msg = f'Input: {in_files["epochs"].basename}'
@@ -98,10 +113,17 @@ def run_evoked(
 
     # Report
     if evokeds:
-        msg = f"Adding {len(evokeds)} evoked signals and contrasts to the " f"report."
+        n_contrasts = len(cfg.contrasts)
+        n_signals = len(evokeds) - n_contrasts
+        msg = (
+            f"Adding {n_signals} evoked response{_pl(n_signals)} and "
+            f"{n_contrasts} contrast{_pl(n_contrasts)} to the report."
+        )
     else:
         msg = "No evoked conditions or contrasts found."
     logger.info(**gen_log_kwargs(message=msg))
+    all_conditions = _all_conditions(cfg=cfg)
+    assert list(all_conditions) == list(all_evoked)  # otherwise we have a bug
     with _open_report(
         cfg=cfg, exec_params=exec_params, subject=subject, session=session
     ) as report:
@@ -138,7 +160,7 @@ def run_evoked(
         #                       topomap_args=topomap_args)
     assert len(in_files) == 0, in_files.keys()
 
-    return out_files
+    return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
 
 def get_config(
@@ -150,6 +172,7 @@ def get_config(
         contrasts=get_all_contrasts(config),
         noise_cov=_sanitize_callable(config.noise_cov),
         analyze_channels=config.analyze_channels,
+        eeg_reference=get_eeg_reference(config),
         ch_types=config.ch_types,
         report_evoked_n_time_points=config.report_evoked_n_time_points,
         **_bids_kwargs(config=config),

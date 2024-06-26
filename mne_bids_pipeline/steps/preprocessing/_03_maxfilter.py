@@ -15,41 +15,175 @@ The function loads machine-specific calibration files.
 """
 
 import gc
-from typing import Optional
+from copy import deepcopy
 from types import SimpleNamespace
 
-import numpy as np
 import mne
+import numpy as np
 from mne_bids import read_raw_bids
 
 from ..._config_utils import (
+    _pl,
     get_mf_cal_fname,
     get_mf_ctc_fname,
-    get_subjects,
-    get_sessions,
     get_runs_tasks,
+    get_sessions,
+    get_subjects,
 )
 from ..._import_data import (
-    import_experimental_data,
-    import_er_data,
+    _get_mf_reference_run_path,
     _get_run_path,
     _get_run_rest_noise_path,
-    _get_mf_reference_run_path,
     _import_data_kwargs,
+    import_er_data,
+    import_experimental_data,
 )
 from ..._logging import gen_log_kwargs, logger
-from ..._parallel import parallel_func, get_parallel_backend
-from ..._report import _open_report, _add_raw
-from ..._run import failsafe_run, save_logs, _update_for_splits
+from ..._parallel import get_parallel_backend, parallel_func
+from ..._report import _add_raw, _open_report
+from ..._run import _prep_out_files, _update_for_splits, failsafe_run, save_logs
+
+
+# %% eSSS
+def get_input_fnames_esss(
+    *,
+    cfg: SimpleNamespace,
+    subject: str,
+    session: str | None,
+) -> dict:
+    kwargs = dict(
+        cfg=cfg,
+        subject=subject,
+        session=session,
+    )
+    in_files = _get_run_rest_noise_path(
+        run=None,
+        task="noise",
+        kind="orig",
+        mf_reference_run=cfg.mf_reference_run,
+        **kwargs,
+    )
+    in_files.update(_get_mf_reference_run_path(**kwargs))
+    return in_files
+
+
+@failsafe_run(
+    get_input_fnames=get_input_fnames_esss,
+)
+def compute_esss_proj(
+    *,
+    cfg: SimpleNamespace,
+    exec_params: SimpleNamespace,
+    subject: str,
+    session: str | None,
+    in_files: dict,
+) -> dict:
+    import matplotlib.pyplot as plt
+
+    run, task = None, "noise"
+    in_key = f"raw_task-{task}_run-{run}"
+    bids_path_in = in_files.pop(in_key)
+    bids_path_bads_in = in_files.pop(f"{in_key}-bads", None)  # noqa
+    bids_path_ref_in = in_files.pop("raw_ref_run")
+    bids_path_ref_bads_in = in_files.pop("raw_ref_run-bads", None)
+    raw_noise = import_er_data(
+        cfg=cfg,
+        bids_path_er_in=bids_path_in,
+        bids_path_ref_in=bids_path_ref_in,
+        # TODO: This must match below, so we don't pass it
+        # bids_path_er_bads_in=bids_path_bads_in,
+        bids_path_er_bads_in=None,
+        bids_path_ref_bads_in=bids_path_ref_bads_in,
+        prepare_maxwell_filter=True,
+    )
+    logger.info(
+        **gen_log_kwargs(
+            f"Computing eSSS basis with {cfg.mf_esss} component{_pl(cfg.mf_esss)}"
+        )
+    )
+    projs = mne.compute_proj_raw(
+        raw_noise,
+        n_grad=cfg.mf_esss,
+        n_mag=cfg.mf_esss,
+        reject=cfg.mf_esss_reject,
+        meg="combined",
+    )
+    out_files = dict()
+    out_files["esss_basis"] = bids_path_in.copy().update(
+        subject=subject,  # need these in the case of an empty room match
+        session=session,
+        run=run,
+        task=task,
+        suffix="esssproj",
+        split=None,
+        extension=".fif",
+        root=cfg.deriv_root,
+        check=False,
+    )
+    mne.write_proj(out_files["esss_basis"], projs, overwrite=True)
+
+    with _open_report(
+        cfg=cfg,
+        exec_params=exec_params,
+        subject=subject,
+        session=session,
+        run=run,
+        task=task,
+    ) as report:
+        msg = "Adding eSSS projectors to report."
+        logger.info(**gen_log_kwargs(message=msg))
+        kinds_picks = list()
+        for kind in ("mag", "grad"):
+            picks = mne.pick_types(raw_noise.info, meg=kind, exclude="bads")
+            if not len(picks):
+                continue
+            kinds_picks.append([kind, picks])
+        n_row, n_col = len(kinds_picks), cfg.mf_esss
+        fig, axes = plt.subplots(
+            n_row,
+            n_col,
+            figsize=(n_col + 0.5, n_row + 0.5),
+            constrained_layout=True,
+            squeeze=False,
+        )
+        # TODO: plot_projs_topomap doesn't handle meg="combined" well:
+        # https://github.com/mne-tools/mne-python/pull/11792
+        for ax_row, (kind, picks) in zip(axes, kinds_picks):
+            info = mne.pick_info(raw_noise.info, picks)
+            ch_names = info["ch_names"]
+            these_projs = deepcopy(projs)
+            for proj in these_projs:
+                sub_idx = [proj["data"]["col_names"].index(name) for name in ch_names]
+                proj["data"]["data"] = proj["data"]["data"][:, sub_idx]
+                proj["data"]["col_names"] = ch_names
+            mne.viz.plot_projs_topomap(
+                these_projs,
+                info=info,
+                axes=ax_row,
+            )
+            for ai, ax in enumerate(ax_row):
+                ax.set_title(f"{kind} {ai + 1}")
+        report.add_figure(
+            fig,
+            title="eSSS projectors",
+            tags=("sss", "raw"),
+            replace=True,
+        )
+        plt.close(fig)
+
+    return _prep_out_files(exec_params=exec_params, out_files=out_files)
+
+
+# %% maxwell_filter
 
 
 def get_input_fnames_maxwell_filter(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
-    run: Optional[str],
-    task: Optional[str],
+    session: str | None,
+    run: str | None,
+    task: str | None,
 ) -> dict:
     """Get paths of files required by maxwell_filter function."""
     kwargs = dict(
@@ -64,6 +198,8 @@ def get_input_fnames_maxwell_filter(
         mf_reference_run=cfg.mf_reference_run,
         **kwargs,
     )
+    in_key = f"raw_task-{task}_run-{run}"
+    assert in_key in in_files
     # head positions
     if cfg.mf_mc:
         if run is None and task == "noise":
@@ -77,16 +213,51 @@ def get_input_fnames_maxwell_filter(
             kind="orig",
             **kwargs,
         )[f"raw_task-{pos_task}_run-{pos_run}"]
-        in_files[f"raw_task-{task}_run-{run}-pos"] = path.update(
-            extension=".pos",
+        in_files[f"{in_key}-pos"] = path.update(
+            suffix="headpos",
+            extension=".txt",
             root=cfg.deriv_root,
             check=False,
             task=pos_task,
             run=pos_run,
         )
 
+    if cfg.mf_esss:
+        in_files["esss_basis"] = (
+            in_files[in_key]
+            .copy()
+            .update(
+                subject=subject,
+                session=session,
+                run=None,
+                task="noise",
+                suffix="esssproj",
+                split=None,
+                extension=".fif",
+                root=cfg.deriv_root,
+                check=False,
+            )
+        )
+
     # reference run (used for `destination` and also bad channels for noise)
-    in_files.update(_get_mf_reference_run_path(add_bads=True, **kwargs))
+    # use add_bads=None here to mean "add if autobad is turned on"
+    in_files.update(_get_mf_reference_run_path(**kwargs))
+
+    is_rest_noise = run is None and task in ("noise", "rest")
+    if is_rest_noise:
+        key = "raw_ref_run_sss"
+        in_files[key] = (
+            in_files["raw_ref_run"]
+            .copy()
+            .update(
+                processing="sss",
+                suffix="raw",
+                extension=".fif",
+                root=cfg.deriv_root,
+                check=False,
+            )
+        )
+        _update_for_splits(in_files, key, single=True)
 
     # standard files
     in_files["mf_cal_fname"] = cfg.mf_cal_fname
@@ -102,9 +273,9 @@ def run_maxwell_filter(
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
-    session: Optional[str],
-    run: Optional[str],
-    task: Optional[str],
+    session: str | None,
+    run: str | None,
+    task: str | None,
     in_files: dict,
 ) -> dict:
     if cfg.proc and "sss" in cfg.proc and cfg.use_maxwell_filter:
@@ -139,13 +310,9 @@ def run_maxwell_filter(
         extension=".fif",
         root=cfg.deriv_root,
         check=False,
+        split=None,
     )
     bids_path_out = bids_path_in.copy().update(**bids_path_out_kwargs)
-
-    # Now take everything from the bids_path_in and overwrite the parameters
-    subject = bids_path_in.subject  # noqa: F841
-    session = bids_path_in.session  # noqa: F841
-    run = bids_path_in.run
 
     out_files = dict()
     # Load dev_head_t and digitization points from MaxFilter reference run.
@@ -167,15 +334,23 @@ def run_maxwell_filter(
 
     # Maxwell-filter experimental data.
     apply_msg = "Applying "
+    extra = list()
     if cfg.mf_st_duration:
         apply_msg += f"tSSS ({cfg.mf_st_duration} sec, corr={cfg.mf_st_correlation})"
     else:
         apply_msg += "SSS"
     if cfg.mf_mc:
-        apply_msg += " with MC"
+        extra.append("MC")
         head_pos = mne.chpi.read_head_pos(in_files.pop(f"{in_key}-pos"))
     else:
         head_pos = None
+    if cfg.mf_esss:
+        extra.append("eSSS")
+        extended_proj = mne.read_proj(in_files.pop("esss_basis"))
+    else:
+        extended_proj = ()
+    if extra:
+        apply_msg += " with " + "/".join(extra)
     apply_msg += " to"
 
     mf_kws = dict(
@@ -187,6 +362,7 @@ def run_maxwell_filter(
         coord_frame="head",
         destination=destination,
         head_pos=head_pos,
+        extended_proj=extended_proj,
     )
 
     logger.info(**gen_log_kwargs(message=f"{apply_msg} {recording_type} data"))
@@ -249,7 +425,7 @@ def run_maxwell_filter(
         # copy the bad channel selection from the reference run over to
         # the resting-state recording.
 
-        bids_path_ref_sss = bids_path_ref_in.copy().update(**bids_path_out_kwargs)
+        bids_path_ref_sss = in_files.pop("raw_ref_run_sss")
         raw_exp = mne.io.read_raw_fif(bids_path_ref_sss)
         rank_exp = mne.compute_rank(raw_exp, rank="info")["meg"]
         rank_noise = mne.compute_rank(raw_sss, rank="info")["meg"]
@@ -282,6 +458,42 @@ def run_maxwell_filter(
             t_window=cfg.mf_mc_t_window,
         )
 
+    if cfg.mf_mc and (
+        cfg.mf_mc_rotation_velocity_limit is not None
+        or cfg.mf_mc_translation_velocity_limit is not None
+    ):
+        movement_annot, _ = mne.preprocessing.annotate_movement(
+            raw_sss,
+            pos=head_pos,
+            rotation_velocity_limit=cfg.mf_mc_rotation_velocity_limit,
+            translation_velocity_limit=cfg.mf_mc_translation_velocity_limit,
+        )
+        perc_time = 100 / raw_sss.times[-1]
+        extra_html = list()
+        for kind, unit in (("translation", "m"), ("rotation", "°")):
+            limit = getattr(cfg, f"mf_mc_{kind}_velocity_limit")
+            if limit is None:
+                continue
+            desc = (f"BAD_mov_{kind[:5]}_vel",)
+            tot_time = np.sum(
+                movement_annot.duration[movement_annot.description == desc]
+            )
+            perc = perc_time * tot_time
+            logger_meth = logger.warning if perc > 20 else logger.info
+            msg = (
+                f"{kind.capitalize()} velocity exceeded {limit} {unit}/s "
+                f"limit for {tot_time:0.1f} s ({perc:0.1f}%)"
+            )
+            logger_meth(**gen_log_kwargs(message=msg))
+            extra_html.append(f"<li>{msg}</li>")
+        extra_html = (
+            "<p>The raw data were annotated with the following movement-related bad "
+            f"segment annotations:<ul>{''.join(extra_html)}</ul></p>"
+        )
+        raw_sss.set_annotations(raw_sss.annotations + movement_annot)
+    else:
+        movement_annot = extra_html = None
+
     out_files["sss_raw"] = bids_path_out
     msg = f"Writing {out_files['sss_raw'].fpath.relative_to(cfg.deriv_root)}"
     logger.info(**gen_log_kwargs(message=msg))
@@ -307,6 +519,7 @@ def run_maxwell_filter(
     ) as report:
         msg = "Adding Maxwell filtered raw data to report."
         logger.info(**gen_log_kwargs(message=msg))
+
         _add_raw(
             cfg=cfg,
             report=report,
@@ -314,17 +527,32 @@ def run_maxwell_filter(
             title="Raw (maxwell filtered)",
             tags=("sss",),
             raw=raw_sss,
+            extra_html=extra_html,
         )
 
     assert len(in_files) == 0, in_files.keys()
-    return out_files
+    return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
 
-def get_config(
+def get_config_esss(
     *,
     config: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
+) -> SimpleNamespace:
+    cfg = SimpleNamespace(
+        mf_esss=config.mf_esss,
+        mf_esss_reject=config.mf_esss_reject,
+        **_import_data_kwargs(config=config, subject=subject),
+    )
+    return cfg
+
+
+def get_config_maxwell_filter(
+    *,
+    config: SimpleNamespace,
+    subject: str,
+    session: str | None,
 ) -> SimpleNamespace:
     cfg = SimpleNamespace(
         mf_cal_fname=get_mf_cal_fname(
@@ -345,6 +573,9 @@ def get_config(
         mf_destination=config.mf_destination,
         mf_int_order=config.mf_int_order,
         mf_mc_t_window=config.mf_mc_t_window,
+        mf_mc_rotation_velocity_limit=config.mf_mc_rotation_velocity_limit,
+        mf_mc_translation_velocity_limit=config.mf_mc_translation_velocity_limit,
+        mf_esss=config.mf_esss,
         **_import_data_kwargs(config=config, subject=subject),
     )
     return cfg
@@ -358,25 +589,55 @@ def main(*, config: SimpleNamespace) -> None:
         return
 
     with get_parallel_backend(config.exec_params):
+        logs = list()
+        # First step: compute eSSS projectors
+        if config.mf_esss:
+            parallel, run_func = parallel_func(
+                compute_esss_proj, exec_params=config.exec_params
+            )
+            logs += parallel(
+                run_func(
+                    cfg=get_config_esss(
+                        config=config,
+                        subject=subject,
+                        session=session,
+                    ),
+                    exec_params=config.exec_params,
+                    subject=subject,
+                    session=session,
+                )
+                for subject in get_subjects(config)
+                for session in get_sessions(config)
+            )
+
+        # Second: maxwell_filter
         parallel, run_func = parallel_func(
             run_maxwell_filter, exec_params=config.exec_params
         )
-        logs = parallel(
-            run_func(
-                cfg=get_config(config=config, subject=subject, session=session),
-                exec_params=config.exec_params,
-                subject=subject,
-                session=session,
-                run=run,
-                task=task,
+        # We need to guarantee that the reference_run completes before the
+        # noise/rest runs are processed, so we split the loops.
+        for which in [("runs",), ("noise", "rest")]:
+            logs += parallel(
+                run_func(
+                    cfg=get_config_maxwell_filter(
+                        config=config,
+                        subject=subject,
+                        session=session,
+                    ),
+                    exec_params=config.exec_params,
+                    subject=subject,
+                    session=session,
+                    run=run,
+                    task=task,
+                )
+                for subject in get_subjects(config)
+                for session in get_sessions(config)
+                for run, task in get_runs_tasks(
+                    config=config,
+                    subject=subject,
+                    session=session,
+                    which=which,
+                )
             )
-            for subject in get_subjects(config)
-            for session in get_sessions(config)
-            for run, task in get_runs_tasks(
-                config=config,
-                subject=subject,
-                session=session,
-            )
-        )
 
     save_logs(config=config, logs=logs)

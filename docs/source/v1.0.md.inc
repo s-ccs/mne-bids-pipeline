@@ -7,7 +7,7 @@ the release, so we are bumping the patch version number rather than the major
 version number.
 
 - The `N_JOBS` parameter has been renamed to
-  [`n_jobs`](mne_bids_pipeline._config.n_jobs) for consistency
+  [`n_jobs`][mne_bids_pipeline._config.n_jobs] for consistency
   (#694 by @larsoner)
 
 ### :bug: Bug fixes
@@ -109,7 +109,7 @@ Changes were only tracked starting April 15, 2021.
   [`ssp_reject_ecg`][mne_bids_pipeline._config.ssp_reject_ecg].
   (#392 by @agramfort, @dengemann,
    @apmellot and @hoechenberger)
-- You can now use autoreject for exclusing artifacts before SSP estimation via
+- You can now use autoreject for excluding artifacts before SSP estimation via
   the `autoreject_global` option in [`ssp_reject_eog`][mne_bids_pipeline._config.ssp_reject_eog]
   and [`ssp_reject_ecg`][mne_bids_pipeline._config.ssp_reject_ecg].
   (#396 by @agramfort, @dengemann,

@@ -4,32 +4,33 @@ Calculate forward solution for M/EEG channels.
 """
 
 from types import SimpleNamespace
-from typing import Optional
 
 import mne
+import numpy as np
 from mne.coreg import Coregistration
 from mne_bids import BIDSPath, get_head_mri_trans
 
 from ..._config_utils import (
-    get_fs_subject,
-    get_subjects,
+    _bids_kwargs,
     _get_bem_conductivity,
+    _meg_in_ch_types,
+    get_fs_subject,
     get_fs_subjects_dir,
     get_runs,
-    _meg_in_ch_types,
     get_sessions,
-    _bids_kwargs,
+    get_subjects,
 )
-from ..._config_import import _import_config
-from ..._logging import logger, gen_log_kwargs
+from ..._logging import gen_log_kwargs, logger
 from ..._parallel import get_parallel_backend, parallel_func
-from ..._report import _open_report
-from ..._run import failsafe_run, save_logs
+from ..._report import _open_report, _render_bem
+from ..._run import _prep_out_files, _sanitize_callable, failsafe_run, save_logs
 
 
 def _prepare_trans_template(
     *,
     cfg: SimpleNamespace,
+    subject: str,
+    session: str | None,
     info: mne.Info,
 ) -> mne.transforms.Transform:
     assert isinstance(cfg.use_template_mri, str)
@@ -47,58 +48,40 @@ def _prepare_trans_template(
         )
     else:
         fiducials = "estimated"  # get fiducials from fsaverage
+        logger.info(**gen_log_kwargs("Matching template MRI using fiducials"))
         coreg = Coregistration(
             info, cfg.fs_subject, cfg.fs_subjects_dir, fiducials=fiducials
         )
-        coreg.fit_fiducials(verbose=True)
+        # Adapted from MNE-Python
+        coreg.fit_fiducials(verbose=False)
+        dist = np.median(coreg.compute_dig_mri_distances() * 1000)
+        logger.info(**gen_log_kwargs(f"Median dig ↔ MRI distance: {dist:6.2f} mm"))
         trans = coreg.trans
 
     return trans
 
 
-def _prepare_trans(
+def _prepare_trans_subject(
     *,
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
+    subject: str,
+    session: str | None,
     bids_path: BIDSPath,
 ) -> mne.transforms.Transform:
     # Generate a head ↔ MRI transformation matrix from the
     # electrophysiological and MRI sidecar files, and save it to an MNE
     # "trans" file in the derivatives folder.
-    subject, session = bids_path.subject, bids_path.session
 
-    # TODO: This breaks our encapsulation
-    config = _import_config(
-        config_path=exec_params.config_path,
-        check=False,
-        log=False,
-    )
-    if config.mri_t1_path_generator is None:
-        t1_bids_path = None
-    else:
-        t1_bids_path = BIDSPath(subject=subject, session=session, root=cfg.bids_root)
-        t1_bids_path = config.mri_t1_path_generator(t1_bids_path.copy())
-        if t1_bids_path.suffix is None:
-            t1_bids_path.update(suffix="T1w")
-        if t1_bids_path.datatype is None:
-            t1_bids_path.update(datatype="anat")
-
-    if config.mri_landmarks_kind is None:
-        landmarks_kind = None
-    else:
-        landmarks_kind = config.mri_landmarks_kind(
-            BIDSPath(subject=subject, session=session)
-        )
-
-    msg = "Estimating head ↔ MRI transform"
+    msg = "Computing head ↔ MRI transform from matched fiducials"
     logger.info(**gen_log_kwargs(message=msg))
 
     trans = get_head_mri_trans(
         bids_path.copy().update(run=cfg.runs[0], root=cfg.bids_root, extension=None),
-        t1_bids_path=t1_bids_path,
+        t1_bids_path=cfg.t1_bids_path,
         fs_subject=cfg.fs_subject,
         fs_subjects_dir=cfg.fs_subjects_dir,
-        kind=landmarks_kind,
+        kind=cfg.landmarks_kind,
     )
 
     return trans
@@ -119,7 +102,18 @@ def get_input_fnames_forward(*, cfg, subject, session):
         check=False,
     )
     in_files = dict()
-    in_files["info"] = bids_path.copy().update(**cfg.source_info_path_update)
+    # for consistency with 05_make_inverse, read the info from the
+    # data used for the noise_cov
+    if cfg.source_info_path_update is None:
+        if cfg.noise_cov in ("rest", "noise"):
+            source_info_path_update = dict(
+                processing="clean", suffix="raw", task=cfg.noise_cov
+            )
+        else:
+            source_info_path_update = dict(suffix="ave")
+    else:
+        source_info_path_update = cfg.source_info_path_update
+    in_files["info"] = bids_path.copy().update(**source_info_path_update)
     bem_path = cfg.fs_subjects_dir / cfg.fs_subject / "bem"
     _, tag = _get_bem_conductivity(cfg)
     in_files["bem"] = bem_path / f"{cfg.fs_subject}-{tag}-bem-sol.fif"
@@ -135,7 +129,7 @@ def run_forward(
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
-    session: Optional[str],
+    session: str | None,
     in_files: dict,
 ) -> dict:
     bids_path = BIDSPath(
@@ -174,11 +168,15 @@ def run_forward(
     if cfg.use_template_mri is not None:
         trans = _prepare_trans_template(
             cfg=cfg,
+            subject=subject,
+            session=session,
             info=info,
         )
     else:
-        trans = _prepare_trans(
+        trans = _prepare_trans_subject(
             cfg=cfg,
+            subject=subject,
+            session=session,
             exec_params=exec_params,
             bids_path=bids_path,
         )
@@ -200,17 +198,7 @@ def run_forward(
     ) as report:
         msg = "Adding forward information to report"
         logger.info(**gen_log_kwargs(message=msg))
-        msg = "Rendering MRI slices with BEM contours."
-        logger.info(**gen_log_kwargs(message=msg))
-        report.add_bem(
-            subject=cfg.fs_subject,
-            subjects_dir=cfg.fs_subjects_dir,
-            title="BEM",
-            width=256,
-            decim=8,
-            replace=True,
-            n_jobs=1,  # prevent automatic parallelization
-        )
+        _render_bem(report=report, cfg=cfg, subject=subject, session=session)
         msg = "Rendering sensor alignment (coregistration)"
         logger.info(**gen_log_kwargs(message=msg))
         report.add_trans(
@@ -233,14 +221,31 @@ def run_forward(
         )
 
     assert len(in_files) == 0, in_files
-    return out_files
+    return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
 
 def get_config(
     *,
     config: SimpleNamespace,
     subject: str,
+    session: str | None,
 ) -> SimpleNamespace:
+    if config.mri_t1_path_generator is None:
+        t1_bids_path = None
+    else:
+        t1_bids_path = BIDSPath(subject=subject, session=session, root=config.bids_root)
+        t1_bids_path = config.mri_t1_path_generator(t1_bids_path.copy())
+        if t1_bids_path.suffix is None:
+            t1_bids_path.update(suffix="T1w")
+        if t1_bids_path.datatype is None:
+            t1_bids_path.update(datatype="anat")
+    if config.mri_landmarks_kind is None:
+        landmarks_kind = None
+    else:
+        landmarks_kind = config.mri_landmarks_kind(
+            BIDSPath(subject=subject, session=session)
+        )
+
     cfg = SimpleNamespace(
         runs=get_runs(config=config, subject=subject),
         mindist=config.mindist,
@@ -248,9 +253,12 @@ def get_config(
         use_template_mri=config.use_template_mri,
         adjust_coreg=config.adjust_coreg,
         source_info_path_update=config.source_info_path_update,
+        noise_cov=_sanitize_callable(config.noise_cov),
         ch_types=config.ch_types,
         fs_subject=get_fs_subject(config=config, subject=subject),
         fs_subjects_dir=get_fs_subjects_dir(config),
+        t1_bids_path=t1_bids_path,
+        landmarks_kind=landmarks_kind,
         **_bids_kwargs(config=config),
     )
     return cfg
@@ -267,7 +275,7 @@ def main(*, config: SimpleNamespace) -> None:
         parallel, run_func = parallel_func(run_forward, exec_params=config.exec_params)
         logs = parallel(
             run_func(
-                cfg=get_config(config=config, subject=subject),
+                cfg=get_config(config=config, subject=subject, session=session),
                 exec_params=config.exec_params,
                 subject=subject,
                 session=session,

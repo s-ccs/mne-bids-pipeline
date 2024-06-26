@@ -1,21 +1,22 @@
+from collections.abc import Iterable
 from types import SimpleNamespace
-from typing import Dict, Optional, Iterable, Union, List, Literal
+from typing import Literal
 
 import mne
-from mne.utils import _pl
-from mne_bids import BIDSPath, read_raw_bids, get_bids_path_from_fname
 import numpy as np
 import pandas as pd
+from mne_bids import BIDSPath, get_bids_path_from_fname, read_raw_bids
 
 from ._config_utils import (
-    get_mf_reference_run,
-    get_runs,
-    get_datatype,
-    get_task,
     _bids_kwargs,
     _do_mf_autobad,
+    _pl,
+    get_datatype,
+    get_mf_reference_run,
+    get_runs,
+    get_task,
 )
-from ._io import _read_json, _empty_room_match_path
+from ._io import _read_json
 from ._logging import gen_log_kwargs, logger
 from ._run import _update_for_splits
 from .typing import PathLike
@@ -25,17 +26,17 @@ def make_epochs(
     *,
     task: str,
     subject: str,
-    session: Optional[str],
+    session: str | None,
     raw: mne.io.BaseRaw,
-    event_id: Optional[Union[Dict[str, int], Literal["auto"]]],
-    conditions: Union[Iterable[str], Dict[str, str]],
+    event_id: dict[str, int] | Literal["auto"] | None,
+    conditions: Iterable[str] | dict[str, str],
     tmin: float,
     tmax: float,
-    metadata_tmin: Optional[float],
-    metadata_tmax: Optional[float],
-    metadata_keep_first: Optional[Iterable[str]],
-    metadata_keep_last: Optional[Iterable[str]],
-    metadata_query: Optional[str],
+    metadata_tmin: float | None,
+    metadata_tmax: float | None,
+    metadata_keep_first: Iterable[str] | None,
+    metadata_keep_last: Iterable[str] | None,
+    metadata_query: str | None,
     event_repeated: Literal["error", "drop", "merge"],
     epochs_decim: int,
     task_is_rest: bool,
@@ -147,12 +148,12 @@ def make_epochs(
     return epochs
 
 
-def annotations_to_events(*, raw_paths: List[PathLike]) -> Dict[str, int]:
+def annotations_to_events(*, raw_paths: list[PathLike]) -> dict[str, int]:
     """Generate a unique event name -> event code mapping.
 
     The mapping can that can be used across all passed raws.
     """
-    event_names: List[str] = []
+    event_names: list[str] = []
     for raw_fname in raw_paths:
         raw = mne.io.read_raw_fif(raw_fname)
         _, event_id = mne.events_from_annotations(raw=raw)
@@ -172,8 +173,8 @@ def _rename_events_func(
     cfg: SimpleNamespace,
     raw: mne.io.BaseRaw,
     subject: str,
-    session: Optional[str],
-    run: Optional[str],
+    session: str | None,
+    run: str | None,
 ) -> None:
     """Rename events (actually, annotations descriptions) in ``raw``.
 
@@ -225,7 +226,7 @@ def _load_data(cfg: SimpleNamespace, bids_path: BIDSPath) -> mne.io.BaseRaw:
     subject = bids_path.subject
     raw = read_raw_bids(
         bids_path=bids_path,
-        extra_params=cfg.reader_extra_params,
+        extra_params=cfg.reader_extra_params or {},
         verbose=cfg.read_raw_bids_verbose,
     )
 
@@ -255,7 +256,7 @@ def _drop_channels_func(
     cfg: SimpleNamespace,
     raw: mne.io.BaseRaw,
     subject: str,
-    session: Optional[str],
+    session: str | None,
 ) -> None:
     """Drop channels from the data.
 
@@ -271,8 +272,8 @@ def _create_bipolar_channels(
     cfg: SimpleNamespace,
     raw: mne.io.BaseRaw,
     subject: str,
-    session: Optional[str],
-    run: Optional[str],
+    session: str | None,
+    run: str | None,
 ) -> None:
     """Create a channel from a bipolar referencing scheme..
 
@@ -317,22 +318,18 @@ def _set_eeg_montage(
     cfg: SimpleNamespace,
     raw: mne.io.BaseRaw,
     subject: str,
-    session: Optional[str],
-    run: Optional[str],
+    session: str | None,
+    run: str | None,
 ) -> None:
     """Set an EEG template montage if requested.
 
     Modifies ``raw`` in-place.
     """
     montage = cfg.eeg_template_montage
-    is_mne_montage = isinstance(montage, mne.channels.montage.DigMontage)
-    montage_name = "custom_montage" if is_mne_montage else montage
     if cfg.datatype == "eeg" and montage:
         msg = f"Setting EEG channel locations to template montage: " f"{montage}."
         logger.info(**gen_log_kwargs(message=msg))
-        if not is_mne_montage:
-            montage = mne.channels.make_standard_montage(montage_name)
-        raw.set_montage(montage, match_case=False, on_missing="warn")
+        raw.set_montage(montage, match_case=False, match_alias=True)
 
 
 def _fix_stim_artifact_func(cfg: SimpleNamespace, raw: mne.io.BaseRaw) -> None:
@@ -355,8 +352,8 @@ def import_experimental_data(
     *,
     cfg: SimpleNamespace,
     bids_path_in: BIDSPath,
-    bids_path_bads_in: Optional[BIDSPath],
-    data_is_rest: Optional[bool],
+    bids_path_bads_in: BIDSPath | None,
+    data_is_rest: bool | None,
 ) -> mne.io.BaseRaw:
     """Run the data import.
 
@@ -402,6 +399,7 @@ def import_experimental_data(
         _fix_stim_artifact_func(cfg=cfg, raw=raw)
 
     if bids_path_bads_in is not None:
+        run = "rest" if data_is_rest else run  # improve logging
         bads = _read_bads_tsv(cfg=cfg, bids_path_bads=bids_path_bads_in)
         msg = f"Marking {len(bads)} channel{_pl(bads)} as bad."
         logger.info(**gen_log_kwargs(message=msg))
@@ -415,9 +413,9 @@ def import_er_data(
     *,
     cfg: SimpleNamespace,
     bids_path_er_in: BIDSPath,
-    bids_path_ref_in: Optional[BIDSPath],
-    bids_path_er_bads_in: Optional[BIDSPath],
-    bids_path_ref_bads_in: Optional[BIDSPath],
+    bids_path_ref_in: BIDSPath | None,
+    bids_path_er_bads_in: BIDSPath | None,
+    bids_path_ref_bads_in: BIDSPath | None,
     prepare_maxwell_filter: bool,
 ) -> mne.io.BaseRaw:
     """Import empty-room data.
@@ -434,6 +432,8 @@ def import_er_data(
         The BIDS path to the empty room bad channels file.
     bids_path_ref_bads_in
         The BIDS path to the reference data bad channels file.
+    prepare_maxwell_filter
+        Whether to prepare the empty-room data for Maxwell filtering.
 
     Returns
     -------
@@ -449,7 +449,6 @@ def import_er_data(
             cfg=cfg,
             bids_path_bads=bids_path_er_bads_in,
         )
-    raw_er.pick_types(meg=True, exclude=[])
 
     # Don't deal with ref for now (initial data quality / auto bad step)
     if bids_path_ref_in is None:
@@ -458,7 +457,7 @@ def import_er_data(
     # Load reference run plus its auto-bads
     raw_ref = read_raw_bids(
         bids_path_ref_in,
-        extra_params=cfg.reader_extra_params,
+        extra_params=cfg.reader_extra_params or {},
         verbose=cfg.read_raw_bids_verbose,
     )
     if bids_path_ref_bads_in is not None:
@@ -492,8 +491,8 @@ def _find_breaks_func(
     cfg,
     raw: mne.io.BaseRaw,
     subject: str,
-    session: Optional[str],
-    run: Optional[str],
+    session: str | None,
+    run: str | None,
 ) -> None:
     if not cfg.find_breaks:
         return
@@ -524,10 +523,10 @@ def _get_bids_path_in(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
-    run: Optional[str],
-    task: Optional[str],
-    kind: Literal["orig", "sss"] = "orig",
+    session: str | None,
+    run: str | None,
+    task: str | None,
+    kind: Literal["orig", "sss", "filt"] = "orig",
 ) -> BIDSPath:
     # b/c can be used before this is updated
     path_kwargs = dict(
@@ -541,13 +540,13 @@ def _get_bids_path_in(
         datatype=get_datatype(config=cfg),
         check=False,
     )
-    if kind == "sss":
+    if kind != "orig":
+        assert kind in ("sss", "filt"), kind
         path_kwargs["root"] = cfg.deriv_root
         path_kwargs["suffix"] = "raw"
         path_kwargs["extension"] = ".fif"
-        path_kwargs["processing"] = "sss"
+        path_kwargs["processing"] = kind
     else:
-        assert kind == "orig", kind
         path_kwargs["root"] = cfg.bids_root
         path_kwargs["suffix"] = None
         path_kwargs["extension"] = None
@@ -560,13 +559,13 @@ def _get_run_path(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
-    run: Optional[str],
-    task: Optional[str],
-    kind: Literal["orig", "sss"],
-    add_bads: Optional[bool] = None,
+    session: str | None,
+    run: str | None,
+    task: str | None,
+    kind: Literal["orig", "sss", "filt"],
+    add_bads: bool | None = None,
     allow_missing: bool = False,
-    key: Optional[str] = None,
+    key: str | None = None,
 ) -> dict:
     bids_path_in = _get_bids_path_in(
         cfg=cfg,
@@ -583,6 +582,8 @@ def _get_run_path(
         add_bads=add_bads,
         kind=kind,
         allow_missing=allow_missing,
+        subject=subject,
+        session=session,
     )
 
 
@@ -590,9 +591,9 @@ def _get_rest_path(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
-    kind: Literal["orig", "sss"],
-    add_bads: Optional[bool] = None,
+    session: str | None,
+    kind: Literal["orig", "sss", "filt"],
+    add_bads: bool | None = None,
 ) -> dict:
     if not (cfg.process_rest and not cfg.task_is_rest):
         return dict()
@@ -612,14 +613,15 @@ def _get_noise_path(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
-    kind: Literal["orig", "sss"],
-    mf_reference_run: Optional[str],
-    add_bads: Optional[bool] = None,
+    session: str | None,
+    kind: Literal["orig", "sss", "filt"],
+    mf_reference_run: str | None,
+    add_bads: bool | None = None,
 ) -> dict:
     if not (cfg.process_empty_room and get_datatype(config=cfg) == "meg"):
         return dict()
-    if kind == "sss":
+    if kind != "orig":
+        assert kind in ("sss", "filt")
         raw_fname = _get_bids_path_in(
             cfg=cfg,
             subject=subject,
@@ -648,6 +650,8 @@ def _get_noise_path(
         add_bads=add_bads,
         kind=kind,
         allow_missing=True,
+        subject=subject,
+        session=session,
     )
 
 
@@ -655,12 +659,12 @@ def _get_run_rest_noise_path(
     *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
-    run: Optional[str],
-    task: Optional[str],
-    kind: Literal["orig", "sss"],
-    mf_reference_run: Optional[str],
-    add_bads: Optional[bool] = None,
+    session: str | None,
+    run: str | None,
+    task: str | None,
+    kind: Literal["orig", "sss", "filt"],
+    mf_reference_run: str | None,
+    add_bads: bool | None = None,
 ) -> dict:
     kwargs = dict(
         cfg=cfg,
@@ -680,10 +684,11 @@ def _get_run_rest_noise_path(
 
 
 def _get_mf_reference_run_path(
+    *,
     cfg: SimpleNamespace,
     subject: str,
-    session: Optional[str],
-    add_bads: bool,
+    session: str | None,
+    add_bads: bool | None = None,
 ) -> dict:
     return _get_run_path(
         cfg=cfg,
@@ -697,14 +702,22 @@ def _get_mf_reference_run_path(
     )
 
 
+def _empty_room_match_path(run_path: BIDSPath, cfg: SimpleNamespace) -> BIDSPath:
+    return run_path.copy().update(
+        extension=".json", suffix="emptyroommatch", root=cfg.deriv_root
+    )
+
+
 def _path_dict(
     *,
     cfg: SimpleNamespace,
     bids_path_in: BIDSPath,
-    add_bads: Optional[bool] = None,
-    kind: Literal["orig", "sss"],
+    add_bads: bool | None = None,
+    kind: Literal["orig", "sss", "filt"],
     allow_missing: bool,
-    key: Optional[str] = None,
+    key: str | None = None,
+    subject: str,
+    session: str | None,
 ) -> dict:
     if add_bads is None:
         add_bads = kind == "orig" and _do_mf_autobad(cfg=cfg)
@@ -715,35 +728,30 @@ def _path_dict(
     if allow_missing and not in_files[key].fpath.exists():
         return dict()
     if add_bads:
-        bads_tsv_fname = _bads_path(cfg=cfg, bids_path_in=bids_path_in)
+        bads_tsv_fname = _bads_path(
+            cfg=cfg,
+            bids_path_in=bids_path_in,
+            subject=subject,
+            session=session,
+        )
         if bads_tsv_fname.fpath.is_file() or not allow_missing:
             in_files[f"{key}-bads"] = bads_tsv_fname
     return in_files
-
-
-def _auto_scores_path(
-    *,
-    cfg: SimpleNamespace,
-    bids_path_in: BIDSPath,
-) -> BIDSPath:
-    return bids_path_in.copy().update(
-        suffix="scores",
-        extension=".json",
-        root=cfg.deriv_root,
-        split=None,
-        check=False,
-    )
 
 
 def _bads_path(
     *,
     cfg: SimpleNamespace,
     bids_path_in: BIDSPath,
+    subject: str,
+    session: str | None,
 ) -> BIDSPath:
     return bids_path_in.copy().update(
         suffix="bads",
         extension=".tsv",
         root=cfg.deriv_root,
+        subject=subject,
+        session=session,
         split=None,
         check=False,
     )
@@ -753,7 +761,7 @@ def _read_bads_tsv(
     *,
     cfg: SimpleNamespace,
     bids_path_bads: BIDSPath,
-) -> List[str]:
+) -> list[str]:
     bads_tsv = pd.read_csv(bids_path_bads.fpath, sep="\t", header=0)
     return bads_tsv[bads_tsv.columns[0]].tolist()
 
@@ -802,3 +810,15 @@ def _import_data_kwargs(*, config: SimpleNamespace, subject: str) -> dict:
         runs=get_runs(config=config, subject=subject),  # XXX needs to accept session!
         **_bids_kwargs(config=config),
     )
+
+
+def _read_raw_msg(
+    bids_path_in: BIDSPath,
+    run: str | None,
+    task: str | None,
+) -> tuple[str]:
+    if run is None and task in ("noise", "rest"):
+        run_type = dict(rest="resting-state", noise="empty-room")[task]
+    else:
+        run_type = "experimental"
+    return f"Reading {run_type} recording: {bids_path_in.basename}", run_type

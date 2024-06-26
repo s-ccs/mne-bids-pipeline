@@ -4,28 +4,30 @@ import copy
 import functools
 import hashlib
 import inspect
-import os
 import pathlib
 import pdb
 import sys
-import traceback
 import time
-from typing import Callable, Optional, Dict, List
+import traceback
+from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Literal
 
-from filelock import FileLock
-from joblib import Memory
 import json_tricks
 import pandas as pd
+from filelock import FileLock
+from joblib import Memory
 from mne_bids import BIDSPath
 
 from ._config_utils import get_task
-from ._logging import logger, gen_log_kwargs
+from ._logging import _is_testing, gen_log_kwargs, logger
 
 
 def failsafe_run(
-    get_input_fnames: Optional[Callable] = None,
-    get_output_fnames: Optional[Callable] = None,
+    *,
+    get_input_fnames: Callable | None = None,
+    get_output_fnames: Callable | None = None,
+    require_output: bool = True,
 ) -> Callable:
     def failsafe_run_decorator(func):
         @functools.wraps(func)  # Preserve "identity" of original function
@@ -37,15 +39,13 @@ def failsafe_run(
                 exec_params=exec_params,
                 get_input_fnames=get_input_fnames,
                 get_output_fnames=get_output_fnames,
+                require_output=require_output,
+                func_name=f"{__mne_bids_pipeline_step__}::{func.__name__}",
             )
-            kwargs_copy = copy.deepcopy(kwargs)
             t0 = time.time()
-            kwargs_copy["cfg"] = json_tricks.dumps(
-                kwargs_copy["cfg"], sort_keys=False, indent=4
-            )
             log_info = pd.concat(
                 [
-                    pd.Series(kwargs_copy, dtype=object),
+                    pd.Series(kwargs, dtype=object),
                     pd.Series(index=["time", "success", "error_message"], dtype=object),
                 ]
             )
@@ -58,10 +58,10 @@ def failsafe_run(
                 log_info["error_message"] = ""
             except Exception as e:
                 # Only keep what gen_log_kwargs() can handle
-                kwargs_copy = {
-                    k: v
-                    for k, v in kwargs_copy.items()
-                    if k in ("subject", "session", "task", "run")
+                kwargs_log = {
+                    k: kwargs[k]
+                    for k in ("subject", "session", "task", "run")
+                    if k in kwargs
                 }
                 message = (
                     f"A critical error occurred. " f"The error message was: {str(e)}"
@@ -72,29 +72,29 @@ def failsafe_run(
                 # Find the limit / step where the error occurred
                 step_dir = pathlib.Path(__file__).parent / "steps"
                 tb = traceback.extract_tb(e.__traceback__)
-                for fi, frame in enumerate(inspect.stack()):
+                for fi, frame in enumerate(tb):
                     is_step = pathlib.Path(frame.filename).parent.parent == step_dir
                     del frame
                     if is_step:
                         # omit everything before the "step" dir, which will
                         # generally be stuff from this file and joblib
-                        tb = tb[-fi:]
+                        tb = tb[fi:]
                         break
                 tb = "".join(traceback.format_list(tb))
 
                 if on_error == "abort":
                     message += f"\n\nAborting pipeline run. The traceback is:\n\n{tb}"
 
-                    if os.getenv("_MNE_BIDS_STUDY_TESTING", "") == "true":
+                    if _is_testing():
                         raise
                     logger.error(
-                        **gen_log_kwargs(message=message, **kwargs_copy, emoji="❌")
+                        **gen_log_kwargs(message=message, **kwargs_log, emoji="❌")
                     )
                     sys.exit(1)
                 elif on_error == "debug":
                     message += "\n\nStarting post-mortem debugger."
                     logger.error(
-                        **gen_log_kwargs(message=message, **kwargs_copy, emoji="🐛")
+                        **gen_log_kwargs(message=message, **kwargs_log, emoji="🐛")
                     )
                     extype, value, tb = sys.exc_info()
                     print(tb)
@@ -103,7 +103,7 @@ def failsafe_run(
                 else:
                     message += "\n\nContinuing pipeline run."
                     logger.error(
-                        **gen_log_kwargs(message=message, **kwargs_copy, emoji="🔂")
+                        **gen_log_kwargs(message=message, **kwargs_log, emoji="🔂")
                     )
             log_info["time"] = round(time.time() - t0, ndigits=1)
             return log_info
@@ -121,10 +121,18 @@ def hash_file_path(path: pathlib.Path) -> str:
 
 
 class ConditionalStepMemory:
-    def __init__(self, *, exec_params, get_input_fnames, get_output_fnames):
+    def __init__(
+        self,
+        *,
+        exec_params: SimpleNamespace,
+        get_input_fnames: Callable | None,
+        get_output_fnames: Callable | None,
+        require_output: bool,
+        func_name: str,
+    ):
         memory_location = exec_params.memory_location
         if memory_location is True:
-            use_location = exec_params.deriv_root / "joblib"
+            use_location = exec_params.deriv_root / exec_params.memory_subdir
         elif not memory_location:
             use_location = None
         else:
@@ -139,6 +147,8 @@ class ConditionalStepMemory:
         self.get_input_fnames = get_input_fnames
         self.get_output_fnames = get_output_fnames
         self.memory_file_method = exec_params.memory_file_method
+        self.require_output = require_output
+        self.func_name = func_name
 
     def cache(self, func):
         def wrapper(*args, **kwargs):
@@ -163,20 +173,7 @@ class ConditionalStepMemory:
             # If this is ever true, we'll need to improve the logic below
             assert not (unknown_inputs and force_run)
 
-            def hash_(k, v):
-                if isinstance(v, BIDSPath):
-                    v = v.fpath
-                assert isinstance(
-                    v, pathlib.Path
-                ), f'Bad type {type(v)}: in_files["{k}"] = {v}'
-                assert v.exists(), f'missing in_files["{k}"] = {v}'
-                if self.memory_file_method == "mtime":
-                    this_hash = v.lstat().st_mtime
-                else:
-                    assert self.memory_file_method == "hash"  # guaranteed
-                    this_hash = hash_file_path(v)
-                return (str(v), this_hash)
-
+            hash_ = functools.partial(_path_to_str_hash, method=self.memory_file_method)
             hashes = []
             for k, v in in_files.items():
                 hashes.append(hash_(k, v))
@@ -211,9 +208,12 @@ class ConditionalStepMemory:
             memorized_func = self.memory.cache(func, ignore=self.ignore)
             msg = emoji = None
             short_circuit = False
-            subject = kwargs.get("subject", None)
-            session = kwargs.get("session", None)
-            run = kwargs.get("run", None)
+            # Used for logging automatically
+            subject = kwargs.get("subject", None)  # noqa
+            session = kwargs.get("session", None)  # noqa
+            run = kwargs.get("run", None)  # noqa
+            task = kwargs.get("task", None)  # noqa
+            bad_out_files = False
             try:
                 done = memorized_func.check_call_in_cache(*args, **kwargs)
             except Exception:
@@ -229,9 +229,31 @@ class ConditionalStepMemory:
                     msg = "Computation forced despite existing cached result …"
                     emoji = "🔂"
                 else:
-                    msg = "Computation unnecessary (cached) …"
-                    emoji = "cache"
-            # When out_files is not None, we should check if the output files
+                    # Check our output file hashes
+                    # Need to make a copy of kwargs["in_files"] in particular
+                    use_kwargs = copy.deepcopy(kwargs)
+                    out_files_hashes = memorized_func(*args, **use_kwargs)
+                    for key, (fname, this_hash) in out_files_hashes.items():
+                        fname = pathlib.Path(fname)
+                        if not fname.exists():
+                            msg = f"Output file missing: {fname}, will recompute …"
+                            emoji = "🧩"
+                            bad_out_files = True
+                            break
+                        got_hash = hash_(key, fname, kind="out")[1]
+                        if this_hash != got_hash:
+                            msg = (
+                                f"Output file {self.memory_file_method} mismatch for "
+                                f"{fname} ({this_hash} != {got_hash}), will "
+                                "recompute …"
+                            )
+                            emoji = "🚫"
+                            bad_out_files = True
+                            break
+                    else:
+                        msg = "Computation unnecessary (cached) …"
+                        emoji = "cache"
+            # When out_files_expected is not None, we should check if the output files
             # exist and stop if they do (e.g., in bem surface or coreg surface
             # creation)
             elif out_files is not None:
@@ -246,40 +268,32 @@ class ConditionalStepMemory:
                     msg = "Computation unnecessary (output files exist) …"
                     emoji = "🔍"
                     short_circuit = True
+            del out_files
+
             if msg is not None:
-                step = _short_step_path(pathlib.Path(inspect.getfile(func)))
-                logger.info(
-                    **gen_log_kwargs(
-                        message=msg,
-                        subject=subject,
-                        session=session,
-                        run=run,
-                        emoji=emoji,
-                        step=step,
-                    )
-                )
+                logger.info(**gen_log_kwargs(message=msg, emoji=emoji))
             if short_circuit:
                 return
 
             # https://joblib.readthedocs.io/en/latest/memory.html#joblib.memory.MemorizedFunc.call  # noqa: E501
-            if force_run or unknown_inputs:
-                out_files, _ = memorized_func.call(*args, **kwargs)
+            if force_run or unknown_inputs or bad_out_files:
+                # Joblib 1.4.0 only returns the output, but 1.3.2 returns both.
+                # Fortunately we can use tuple-ness to tell the difference (we always
+                # return None or a dict)
+                out_files = memorized_func.call(*args, **kwargs)
+                if isinstance(out_files, tuple):
+                    out_files = out_files[0]
             else:
                 out_files = memorized_func(*args, **kwargs)
-            assert isinstance(out_files, dict), type(out_files)
-            out_files_missing_msg = "\n".join(
-                f"- {key}={fname}"
-                for key, fname in out_files.items()
-                if not pathlib.Path(fname).exists()
-            )
-            if out_files_missing_msg:
-                raise ValueError(
-                    "Missing at least one output file: \n"
-                    + out_files_missing_msg
-                    + "\n"
-                    + "This should not happen unless some files "
-                    "have been manually moved or deleted. You "
-                    "need to flush your cache to fix this."
+            if self.require_output:
+                assert isinstance(out_files, dict) and len(out_files), (
+                    f"Internal error: step must return non-empty out_files dict, got "
+                    f"{type(out_files).__name__} for:\n{self.func_name}"
+                )
+            else:
+                assert out_files is None, (
+                    f"Internal error: step must return None, got {type(out_files)} "
+                    f"for:\n{self.func_name}"
                 )
 
         return wrapper
@@ -288,7 +302,7 @@ class ConditionalStepMemory:
         self.memory.clear()
 
 
-def save_logs(*, config: SimpleNamespace, logs) -> None:  # TODO add type
+def save_logs(*, config: SimpleNamespace, logs: list[pd.Series]) -> None:
     fname = config.deriv_root / f"task-{get_task(config)}_log.xlsx"
 
     # Get the script from which the function is called for logging
@@ -296,15 +310,7 @@ def save_logs(*, config: SimpleNamespace, logs) -> None:  # TODO add type
     sheet_name = sheet_name[-30:]  # shorten due to limit of excel format
 
     df = pd.DataFrame(logs)
-
-    columns = df.columns
-    if "cfg" in columns:
-        columns = list(columns)
-        idx = columns.index("cfg")
-        del columns[idx]
-        columns.insert(-3, "cfg")  # put it before time, success & err cols
-
-    df = df[columns]
+    del logs
 
     with FileLock(fname.with_suffix(fname.suffix + ".lock")):
         append = fname.exists()
@@ -314,13 +320,33 @@ def save_logs(*, config: SimpleNamespace, logs) -> None:  # TODO add type
             mode="a" if append else "w",
             if_sheet_exists="replace" if append else None,
         )
+        assert isinstance(config, SimpleNamespace), type(config)
+        cf_df = dict()
+        for key, val in config.__dict__.items():
+            # We need to be careful about functions, json_tricks does not work with them
+            if inspect.isfunction(val):
+                new_val = ""
+                if func_file := inspect.getfile(val):
+                    new_val += f"{func_file}:"
+                if getattr(val, "__qualname__", None):
+                    new_val += val.__qualname__
+                val = "custom callable" if not new_val else new_val
+            val = json_tricks.dumps(val, indent=4, sort_keys=False)
+            # 32767 char limit per cell (could split over lines but if something is
+            # this long, you'll probably get the gist from the first 32k chars)
+            if len(val) > 32767:
+                val = val[:32765] + " …"
+            cf_df[key] = val
+        cf_df = pd.DataFrame([cf_df], dtype=object)
         with writer:
+            # Config first then the data
+            cf_df.to_excel(writer, sheet_name="config", index=False)
             df.to_excel(writer, sheet_name=sheet_name, index=False)
 
 
 def _update_for_splits(
-    files_dict: Dict[str, BIDSPath],
-    key: str,
+    files_dict: dict[str, BIDSPath] | BIDSPath,
+    key: str | None,
     *,
     single: bool = False,
     allow_missing: bool = False,
@@ -362,7 +388,7 @@ def _sanitize_callable(val):
 
 
 def _get_step_path(
-    stack: Optional[List[inspect.FrameInfo]] = None,
+    stack: list[inspect.FrameInfo] | None = None,
 ) -> pathlib.Path:
     if stack is None:
         stack = inspect.stack()
@@ -372,8 +398,10 @@ def _get_step_path(
         if "steps" in fname.parts:
             return fname
         else:  # pragma: no cover
-            if frame.function == "__mne_bids_pipeline_failsafe_wrapper__":
+            try:
                 return frame.frame.f_locals["__mne_bids_pipeline_step__"]
+            except KeyError:
+                pass
     else:  # pragma: no cover
         paths = "\n".join(paths)
         raise RuntimeError(f"Could not find step path in call stack:\n{paths}")
@@ -381,3 +409,54 @@ def _get_step_path(
 
 def _short_step_path(step_path: pathlib.Path) -> str:
     return f"{step_path.parent.name}/{step_path.stem}"
+
+
+def _prep_out_files(
+    *,
+    exec_params: SimpleNamespace,
+    out_files: dict[str, BIDSPath],
+    check_relative: pathlib.Path | None = None,
+    bids_only: bool = True,
+):
+    if check_relative is None:
+        check_relative = exec_params.deriv_root
+    for key, fname in out_files.items():
+        # Sanity check that we only ever write to the derivatives directory
+        if bids_only:
+            assert isinstance(fname, BIDSPath), (type(fname), fname)
+        # raw and epochs can split on write, and .save should check for us now, so
+        # we only need to check *other* types (these should never split)
+        if isinstance(fname, BIDSPath) and fname.suffix not in ("raw", "epo"):
+            assert fname.split is None, fname
+        fname = pathlib.Path(fname)
+        if not fname.is_relative_to(check_relative):
+            raise RuntimeError(
+                f"Output BIDSPath not relative to expected root {check_relative}:"
+                f"\n{fname}"
+            )
+        out_files[key] = _path_to_str_hash(
+            key,
+            fname,
+            method=exec_params.memory_file_method,
+            kind="out",
+        )
+    return out_files
+
+
+def _path_to_str_hash(
+    k: str,
+    v: BIDSPath | pathlib.Path,
+    *,
+    method: Literal["mtime", "hash"],
+    kind: str = "in",
+):
+    if isinstance(v, BIDSPath):
+        v = v.fpath
+    assert isinstance(v, pathlib.Path), f'Bad type {type(v)}: {kind}_files["{k}"] = {v}'
+    assert v.exists(), f'missing {kind}_files["{k}"] = {v}'
+    if method == "mtime":
+        this_hash = v.stat().st_mtime
+    else:
+        assert method == "hash"  # guaranteed
+        this_hash = hash_file_path(v)
+    return (str(v), this_hash)

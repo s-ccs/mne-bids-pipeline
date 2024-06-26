@@ -1,26 +1,26 @@
 """Find empty-room data matches."""
 
 from types import SimpleNamespace
-from typing import Dict, Optional
 
-from mne.utils import _pl
 from mne_bids import BIDSPath
 
 from ..._config_utils import (
+    _bids_kwargs,
+    _pl,
     get_datatype,
+    get_mf_reference_run,
     get_sessions,
     get_subjects,
-    get_mf_reference_run,
-    _bids_kwargs,
 )
-from ..._io import _empty_room_match_path, _write_json
+from ..._import_data import _empty_room_match_path
+from ..._io import _write_json
 from ..._logging import gen_log_kwargs, logger
-from ..._run import _update_for_splits, failsafe_run, save_logs
+from ..._run import _prep_out_files, _update_for_splits, failsafe_run, save_logs
 
 
 def get_input_fnames_find_empty_room(
-    *, subject: str, session: Optional[str], run: Optional[str], cfg: SimpleNamespace
-) -> Dict[str, BIDSPath]:
+    *, subject: str, session: str | None, run: str | None, cfg: SimpleNamespace
+) -> dict[str, BIDSPath]:
     """Get paths of files required by find_empty_room function."""
     bids_path_in = BIDSPath(
         subject=subject,
@@ -35,7 +35,7 @@ def get_input_fnames_find_empty_room(
         root=cfg.bids_root,
         check=False,
     )
-    in_files: Dict[str, BIDSPath] = dict()
+    in_files: dict[str, BIDSPath] = dict()
     in_files[f"raw_run-{run}"] = bids_path_in
     _update_for_splits(in_files, f"raw_run-{run}", single=True)
     if hasattr(bids_path_in, "find_matching_sidecar"):
@@ -62,10 +62,10 @@ def find_empty_room(
     cfg: SimpleNamespace,
     exec_params: SimpleNamespace,
     subject: str,
-    session: Optional[str],
-    run: Optional[str],
-    in_files: Dict[str, BIDSPath],
-) -> Dict[str, BIDSPath]:
+    session: str | None,
+    run: str | None,
+    in_files: dict[str, BIDSPath],
+) -> dict[str, BIDSPath]:
     raw_path = in_files.pop(f"raw_run-{run}")
     in_files.pop("sidecar", None)
     try:
@@ -96,7 +96,7 @@ def find_empty_room(
     out_files = dict()
     out_files["empty_room_match"] = _empty_room_match_path(raw_path, cfg)
     _write_json(out_files["empty_room_match"], dict(fname=fname))
-    return out_files
+    return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
 
 def get_config(
